@@ -1,5 +1,5 @@
 import { Db, EventRow } from '../common/Db';
-import { Api } from '../common/Api';
+import { Api, PaperHit } from '../common/Api';
 
 interface ChatLine {
   role: 'user' | 'assistant';
@@ -59,6 +59,10 @@ struct Index {
   // 日历页：month = "YYYY-MM"
   @State month: string = '';
   @State monthRows: EventRow[] = [];
+  // 文献页（arXiv）
+  @State paperQuery: string = '';
+  @State papers: PaperHit[] = [];
+  @State paperBusy: boolean = false;
 
   aboutToAppear(): void {
     this.reloadToday();
@@ -276,6 +280,26 @@ struct Index {
     }
     this.notices = rows;
     this.message = rows.length > 0 ? `拉到 ${rows.length} 条公告` : '没有新公告';
+  }
+
+  async searchPapers(): Promise<void> {
+    const query = this.paperQuery.trim();
+    if (query.length === 0) {
+      this.message = '先输入检索词（英文效果更好）';
+      return;
+    }
+    this.paperBusy = true;
+    this.message = '正在检索 arXiv…';
+    try {
+      this.papers = await Api.arxivSearch(query, 8);
+      this.message = this.papers.length > 0
+        ? `找到 ${this.papers.length} 篇`
+        : '没找到结果（换英文关键词试试）';
+    } catch (err) {
+      this.message = `检索失败：${err}`;
+    } finally {
+      this.paperBusy = false;
+    }
   }
 
   // ------------------------------------------------------------ 界面
@@ -535,6 +559,61 @@ struct Index {
   }
 
   @Builder
+  literatureTab() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        TextInput({ text: this.paperQuery, placeholder: '搜 arXiv，例如 cross-field MRI' })
+          .layoutWeight(1)
+          .height(40)
+          .borderRadius(10)
+          .onChange((value: string) => { this.paperQuery = value; })
+        Button(this.paperBusy ? '…' : '检索')
+          .height(40)
+          .backgroundColor('#c8546a')
+          .enabled(!this.paperBusy)
+          .onClick(() => { void this.searchPapers(); })
+      }
+      .width('100%')
+
+      if (this.message.length > 0) {
+        Text(this.message).fontSize(12).fontColor('#8a8f98').width('100%')
+      }
+
+      List({ space: 8 }) {
+        ForEach(this.papers, (paper: PaperHit) => {
+          ListItem() {
+            Column({ space: 2 }) {
+              Text(paper.title).fontSize(14).width('100%')
+              Text(`${paper.year} · ${paper.authors}`)
+                .fontSize(12)
+                .fontColor('#8a8f98')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .width('100%')
+              Text(paper.summary)
+                .fontSize(12)
+                .fontColor('#5a5f68')
+                .maxLines(3)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .width('100%')
+            }
+            .alignItems(HorizontalAlign.Start)
+            .width('100%')
+            .padding(10)
+            .borderRadius(10)
+            .backgroundColor('#ffffff')
+          }
+        }, (paper: PaperHit) => paper.url + paper.title)
+      }
+      .layoutWeight(1)
+      .width('100%')
+    }
+    .padding(16)
+    .width('100%')
+    .height('100%')
+  }
+
+  @Builder
   calendarTab() {
     Column({ space: 10 }) {
       Row({ space: 8 }) {
@@ -608,6 +687,7 @@ struct Index {
     Tabs({ index: this.currentTab }) {
       TabContent() { this.todayTab() }.tabBar('今日')
       TabContent() { this.calendarTab() }.tabBar('日历')
+      TabContent() { this.literatureTab() }.tabBar('文献')
       TabContent() { this.chatTab() }.tabBar('梅子')
       TabContent() { this.meTab() }.tabBar('我的')
     }

@@ -51,6 +51,15 @@ interface ChatPayload {
   temperature: number;
 }
 
+/** 文献检索结果（arXiv Atom 条目） */
+export interface PaperHit {
+  title: string;
+  authors: string;
+  year: string;
+  url: string;
+  summary: string;
+}
+
 const DEFAULT_SERVER: string = 'https://43.108.99.38.sslip.io';
 const DEFAULT_BASE_URL: string = 'https://api.deepseek.com/v1';
 const DEFAULT_MODEL: string = 'deepseek-chat';
@@ -208,5 +217,81 @@ export class Api {
     const first = choices[0] as Record<string, Object>;
     const message = first['message'] as Record<string, Object> | undefined;
     return `${message?.['content'] ?? ''}`;
+  }
+
+  // ---------------------------------------------------------------- 文献（arXiv）
+  static async arxivSearch(query: string, limit: number = 8): Promise<PaperHit[]> {
+    const text = encodeURIComponent(query.trim());
+    const url = `https://export.arxiv.org/api/query?search_query=all:${text}&start=0&max_results=${limit}`;
+    const result = await request(http.RequestMethod.GET, url, null, null);
+    if (result.code !== 200) {
+      return [];
+    }
+    const hits: PaperHit[] = [];
+    const chunks = result.body.split('<entry>');
+    for (let i = 1; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      const title = Api.tagText(chunk, 'title');
+      if (title.length === 0) {
+        continue;
+      }
+      const link = Api.firstHref(chunk);
+      hits.push({
+        title: title,
+        authors: Api.tagTexts(chunk, 'name').join(', '),
+        year: Api.tagText(chunk, 'published').slice(0, 4),
+        url: link.replace('/abs/', '/pdf/'),
+        summary: Api.tagText(chunk, 'summary'),
+      });
+    }
+    return hits;
+  }
+
+  private static tagText(chunk: string, tag: string): string {
+    const start = chunk.indexOf(`<${tag}`);
+    if (start < 0) {
+      return '';
+    }
+    const headEnd = chunk.indexOf('>', start);
+    if (headEnd < 0) {
+      return '';
+    }
+    const close = chunk.indexOf(`</${tag}>`, headEnd);
+    if (close < 0) {
+      return '';
+    }
+    return chunk.slice(headEnd + 1, close).replace(/\s+/g, ' ').trim();
+  }
+
+  private static tagTexts(chunk: string, tag: string): string[] {
+    const out: string[] = [];
+    let from = 0;
+    while (out.length < 20) {
+      const start = chunk.indexOf(`<${tag}`, from);
+      if (start < 0) {
+        break;
+      }
+      const headEnd = chunk.indexOf('>', start);
+      if (headEnd < 0) {
+        break;
+      }
+      const close = chunk.indexOf(`</${tag}>`, headEnd);
+      if (close < 0) {
+        break;
+      }
+      out.push(chunk.slice(headEnd + 1, close).replace(/\s+/g, ' ').trim());
+      from = close + tag.length + 3;
+    }
+    return out;
+  }
+
+  private static firstHref(chunk: string): string {
+    const at = chunk.indexOf('href="');
+    if (at < 0) {
+      return '';
+    }
+    const rest = chunk.slice(at + 6);
+    const end = rest.indexOf('"');
+    return end < 0 ? '' : rest.slice(0, end);
   }
 }
