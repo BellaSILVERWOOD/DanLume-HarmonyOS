@@ -59,6 +59,24 @@ const SCHEMA: string[] = [
      created_at TEXT NOT NULL DEFAULT ''
    )`,
   `CREATE INDEX IF NOT EXISTS idx_events_date ON events(date)`,
+  `CREATE TABLE IF NOT EXISTS memos (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     body TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL DEFAULT ''
+   )`,
+  `CREATE TABLE IF NOT EXISTS flashcards (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     question TEXT NOT NULL DEFAULT '',
+     answer TEXT NOT NULL DEFAULT '',
+     tag TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL DEFAULT ''
+   )`,
+  `CREATE TABLE IF NOT EXISTS countdowns (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     title TEXT NOT NULL DEFAULT '',
+     date TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL DEFAULT ''
+   )`,
 ];
 
 let store: relationalStore.RdbStore | null = null;
@@ -194,6 +212,70 @@ export class Db {
     return await Db.need().insert('events', bucket);
   }
 
+  /** 导入前查重：同标题 + 同日期 + 同开始时间就当已经有了 */
+  static async hasEvent(title: string, date: string, startTime: string): Promise<boolean> {
+    const predicates = new relationalStore.RdbPredicates('events');
+    predicates.equalTo('title', title).and().equalTo('date', date).and().equalTo('start_time', startTime);
+    const rows = await Db.need().query(predicates, ['id']);
+    const has = rows.rowCount > 0;
+    rows.close();
+    return has;
+  }
+
+  /** 带完整字段的插入（导入用，保留提醒分钟 / 颜色 / 完成状态） */
+  static async insertEventRow(row: EventRow): Promise<number> {
+    const bucket: relationalStore.ValuesBucket = {
+      title: row.title,
+      description: row.description,
+      date: row.date,
+      start_time: row.start_time,
+      end_time: row.end_time,
+      remind_minutes: row.remind_minutes,
+      color: row.color,
+      done: row.done ? 1 : 0,
+      repeat: '',
+      repeat_until: '',
+      done_dates: '',
+      created_at: Db.stamp(),
+    };
+    return await Db.need().insert('events', bucket);
+  }
+
+  /** 按 id 取一条（AI 工具改 / 删前先看看有没有） */
+  static async eventById(id: number): Promise<EventRow | null> {
+    const predicates = new relationalStore.RdbPredicates('events');
+    predicates.equalTo('id', id);
+    const rows = await Db.need().query(predicates, [
+      'id', 'title', 'description', 'date', 'start_time', 'end_time',
+      'remind_minutes', 'color', 'done', 'reminder_id',
+    ]);
+    let out: EventRow | null = null;
+    if (rows.goToFirstRow()) {
+      out = {
+        id: rows.getLong(rows.getColumnIndex('id')),
+        title: rows.getString(rows.getColumnIndex('title')),
+        description: rows.getString(rows.getColumnIndex('description')),
+        date: rows.getString(rows.getColumnIndex('date')),
+        start_time: rows.getString(rows.getColumnIndex('start_time')),
+        end_time: rows.getString(rows.getColumnIndex('end_time')),
+        remind_minutes: rows.getLong(rows.getColumnIndex('remind_minutes')),
+        color: rows.getString(rows.getColumnIndex('color')),
+        done: rows.getLong(rows.getColumnIndex('done')) === 1,
+        reminder_id: rows.getLong(rows.getColumnIndex('reminder_id')),
+      };
+    }
+    rows.close();
+    return out;
+  }
+
+  /** 全字段更新（AI 工具用，日期也可改） */
+  static async updateEventFields(id: number, title: string, date: string,
+    startTime: string, endTime: string, done: boolean, description: string): Promise<void> {
+    await Db.need().executeSql(
+      'UPDATE events SET title = ?, date = ?, start_time = ?, end_time = ?, done = ?, description = ? WHERE id = ?',
+      [title, date, startTime, endTime, done ? 1 : 0, description, id]);
+  }
+
   static async setDone(id: number, done: boolean): Promise<void> {
     await Db.need().executeSql('UPDATE events SET done = ? WHERE id = ?', [done ? 1 : 0, id]);
   }
@@ -206,9 +288,100 @@ export class Db {
     await Db.need().executeSql('UPDATE events SET title = ? WHERE id = ?', [title, id]);
   }
 
+  /** 日历页编辑：标题 + 开始/结束时间（日期与提醒不动） */
+  static async updateEvent(id: number, title: string, startTime: string, endTime: string): Promise<void> {
+    await Db.need().executeSql(
+      'UPDATE events SET title = ?, start_time = ?, end_time = ? WHERE id = ?',
+      [title, startTime, endTime, id]);
+  }
+
   /** 记下系统提醒 id（0 = 没设提醒） */
   static async setReminderId(id: number, reminderId: number): Promise<void> {
     await Db.need().executeSql('UPDATE events SET reminder_id = ? WHERE id = ?', [reminderId, id]);
+  }
+
+  // ---------------------------------------------------------------- 备忘 / 闪卡 / 倒计时
+  static async memoAdd(body: string): Promise<number> {
+    const bucket: relationalStore.ValuesBucket = { body: body, created_at: Db.stamp() };
+    return await Db.need().insert('memos', bucket);
+  }
+
+  static async memoSearch(query: string, limit: number): Promise<string[]> {
+    const predicates = new relationalStore.RdbPredicates('memos');
+    if (query.length > 0) {
+      predicates.like('body', `%${query}%`);
+    }
+    predicates.orderByDesc('id').limitAs(limit);
+    const rows = await Db.need().query(predicates, ['body']);
+    const out: string[] = [];
+    while (rows.goToNextRow()) {
+      out.push(rows.getString(rows.getColumnIndex('body')));
+    }
+    rows.close();
+    return out;
+  }
+
+  static async flashcardAdd(question: string, answer: string, tag: string): Promise<number> {
+    const bucket: relationalStore.ValuesBucket = {
+      question: question,
+      answer: answer,
+      tag: tag,
+      created_at: Db.stamp(),
+    };
+    return await Db.need().insert('flashcards', bucket);
+  }
+
+  /** 随机抽一张闪卡，返回 [question, answer]；没有就返回空数组 */
+  static async flashcardRandom(): Promise<string[]> {
+    const rows = await Db.need().querySql(
+      'SELECT question, answer FROM flashcards ORDER BY RANDOM() LIMIT 1');
+    const out: string[] = [];
+    if (rows.goToFirstRow()) {
+      out.push(rows.getString(0));
+      out.push(rows.getString(1));
+    }
+    rows.close();
+    return out;
+  }
+
+  static async countFast(sql: string): Promise<number> {
+    const rows = await Db.need().querySql(sql);
+    let n = 0;
+    if (rows.goToFirstRow()) {
+      n = rows.getLong(0);
+    }
+    rows.close();
+    return n;
+  }
+
+  static async countdownAdd(title: string, date: string): Promise<number> {
+    const bucket: relationalStore.ValuesBucket = {
+      title: title,
+      date: date,
+      created_at: Db.stamp(),
+    };
+    return await Db.need().insert('countdowns', bucket);
+  }
+
+  static async countdownList(limit: number): Promise<string[]> {
+    const predicates = new relationalStore.RdbPredicates('countdowns');
+    predicates.orderByAsc('date').limitAs(limit);
+    const rows = await Db.need().query(predicates, ['title', 'date']);
+    const out: string[] = [];
+    while (rows.goToNextRow()) {
+      out.push(`${rows.getString(rows.getColumnIndex('date'))} ${rows.getString(rows.getColumnIndex('title'))}`);
+    }
+    rows.close();
+    return out;
+  }
+
+  /** 计数类设置（usage_stats 用）：每次 +1 */
+  static async bumpCounter(key: string): Promise<number> {
+    const raw = await Db.getSetting(key, '0');
+    const n = parseInt(raw, 10);
+    const next = (isNaN(n) ? 0 : n) + 1;
+    await Db.setSetting(key, `${next}`);
+    return next;
   }
 
   /** 本地时间戳，和桌面版 now_str() 一个格式 */
