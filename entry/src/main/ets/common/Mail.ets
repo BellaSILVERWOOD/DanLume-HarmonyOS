@@ -218,11 +218,11 @@ class ImapClient {
   }
 }
 
-/** 读最近 limit 封邮件的信头（发件人 / 主题 / 日期） */
-export async function fetchInbox(limit: number): Promise<string> {
+/** 读最近 limit 封邮件的信头；出错抛异常（UI 直接显示 e.message） */
+export async function fetchInboxList(limit: number): Promise<MailHeader[]> {
   const cfg = await loadMailConfig();
   if (cfg.address.length === 0 || cfg.auth.length === 0 || cfg.imapHost.length === 0) {
-    return '还没配置邮箱（我的 → 邮件：地址、授权码、IMAP 服务器）';
+    throw new Error('还没配置邮箱（我的 → 邮件：地址、授权码、IMAP 服务器）');
   }
   const n = limit < 1 ? 5 : (limit > 30 ? 30 : limit);
   const client = new ImapClient();
@@ -230,26 +230,33 @@ export async function fetchInbox(limit: number): Promise<string> {
     await client.connect(cfg.imapHost, cfg.imapPort);
     const greet = await client.greeting();
     if (!greet.includes('* OK')) {
-      return `连接被拒：${greet.slice(0, 100)}`;
+      throw new Error(`连接被拒：${greet.slice(0, 100)}`);
     }
     const login = await client.exec(`LOGIN "${cfg.address}" "${cfg.auth}"`);
-    if (!/ a\d+ OK/.test(login) && !login.includes('OK')) {
-      return `登录失败：${login.slice(0, 120)}（授权码，不是登录密码）`;
+    if (!login.includes(' OK')) {
+      throw new Error(`登录失败：${login.slice(0, 120)}（QQ/163 用授权码，不是登录密码）`);
     }
     const select = await client.exec('SELECT "INBOX"');
     const existsMatch = /(\d+) EXISTS/.exec(select);
     const total = existsMatch !== null ? parseInt(existsMatch[1], 10) : 0;
     if (total === 0) {
-      client.close();
-      return '收件箱是空的';
+      return [];
     }
     const from = Math.max(1, total - n + 1);
     const fetch = await client.exec(
       `FETCH ${from}:${total} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])`);
-    const headers = parseHeaders(fetch, from);
+    return parseHeaders(fetch, from);
+  } finally {
     client.close();
+  }
+}
+
+/** 读最近 limit 封邮件的信头，拼成给人看的字符串（AI 工具用） */
+export async function fetchInbox(limit: number): Promise<string> {
+  try {
+    const headers = await fetchInboxList(limit);
     if (headers.length === 0) {
-      return '读到了响应但没解析出邮件（可能服务器格式不同）';
+      return '收件箱是空的（或还没收到邮件）';
     }
     const lines: string[] = [];
     for (const h of headers) {
@@ -257,9 +264,94 @@ export async function fetchInbox(limit: number): Promise<string> {
     }
     return lines.join('\n');
   } catch (err) {
-    client.close();
-    return `收信出错：${err}`;
+    return `收信出错：${err instanceof Error ? err.message : err}`;
   }
+}
+
+/** 取第 seq 封的正文（best effort：解 base64 / quoted-printable，HTML 去标签） */
+export async function fetchMailBody(seq: number): Promise<string> {
+  const cfg = await loadMailConfig();
+  if (cfg.address.length === 0 || cfg.auth.length === 0) {
+    throw new Error('还没配置邮箱');
+  }
+  const client = new ImapClient();
+  try {
+    await client.connect(cfg.imapHost, cfg.imapPort);
+    await client.greeting();
+    const login = await client.exec(`LOGIN "${cfg.address}" "${cfg.auth}"`);
+    if (!login.includes(' OK')) {
+      throw new Error('IMAP 登录失败（授权码）');
+    }
+    await client.exec('SELECT "INBOX"');
+    const raw = await client.exec(`FETCH ${seq} BODY.PEEK[]`);
+    const message = extractLiteral(raw);
+    return decodeMessage(message);
+  } finally {
+    client.close();
+  }
+}
+
+/** IMAP 的 {123}\r\n<123 字节> 字面量 */
+function extractLiteral(raw: string): string {
+  const m = /\{(\d+)\}\r\n/.exec(raw);
+  if (m === null) {
+    return '';
+  }
+  const start = m.index + m[0].length;
+  const size = parseInt(m[1], 10);
+  return raw.substr(start, size);
+}
+
+function decodeQuotedPrintable(text: string): string {
+  const joined = text.replace(/=\r\n/g, '');
+  let out = '';
+  let i = 0;
+  while (i < joined.length) {
+    const c = joined.charAt(i);
+    if (c === '=' && i + 2 < joined.length) {
+      const hex = joined.substring(i + 1, i + 3);
+      const code = parseInt(hex, 16);
+      if (!isNaN(code)) {
+        out += String.fromCharCode(code);
+        i += 3;
+        continue;
+      }
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+function decodeMessage(message: string): string {
+  if (message.length === 0) {
+    return '（这封邮件读不出正文）';
+  }
+  const split = message.indexOf('\r\n\r\n');
+  const head = split >= 0 ? message.substring(0, split) : message;
+  let body = split >= 0 ? message.substring(split + 4) : '';
+  const isBase64 = /Content-Transfer-Encoding:\s*base64/i.test(head);
+  const isQp = /Content-Transfer-Encoding:\s*quoted-printable/i.test(head);
+  const isHtml = /Content-Type:\s*text\/html/i.test(head);
+  try {
+    if (isBase64) {
+      body = buffer.from(body.replace(/\s+/g, ''), 'base64').toString('utf8');
+    } else if (isQp) {
+      body = decodeQuotedPrintable(body);
+    }
+  } catch (e) {
+    // 解码失败就按原文显示
+  }
+  if (isHtml) {
+    body = body.replace(/<style[\s\S]*?<\/style>/gi, ' ');
+    body = body.replace(/<script[\s\S]*?<\/script>/gi, ' ');
+    body = body.replace(/<br\s*\/?>/gi, '\n');
+    body = body.replace(/<[^>]+>/g, ' ');
+    body = body.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>').replace(/&quot;/g, '"');
+    body = body.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n');
+  }
+  return body.trim().slice(0, 6000);
 }
 
 function parseHeaders(raw: string, firstIndex: number): MailHeader[] {

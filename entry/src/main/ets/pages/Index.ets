@@ -1,8 +1,8 @@
 import { Db, EventRow } from '../common/Db';
 import { Api, PaperHit, AiProfile } from '../common/Api';
-import { importSystemCalendar, importDlpk } from '../common/Migrate';
+import { importSystemCalendar, importDlpk, exportDayToSystem } from '../common/Migrate';
 import { PHONE_TOOL_NAMES, TOOL_LABELS, toolKey } from '../common/AiTools';
-import { sendMail, fetchInbox } from '../common/Mail';
+import { sendMail, fetchInbox, fetchInboxList, fetchMailBody, MailHeader } from '../common/Mail';
 import { parseMarkdown, MdBlock, MdKind, MdSpan } from '../common/Md';
 import common from '@ohos.app.ability.common';
 import reminderAgentManager from '@ohos.reminderAgentManager';
@@ -76,6 +76,11 @@ struct Index {
   @State mailImapPort: string = '993';
   @State inboxText: string = '';
   @State mailBusy: boolean = false;
+  @State mailTo: string = '';
+  @State mailSubject: string = '';
+  @State mailBody: string = '';
+  @State inboxList: MailHeader[] = [];
+  @State inboxDetail: string = '';
   // 小工具：备忘 / 倒计时 / 闪卡 / 番茄钟
   @State memos: string[] = [];
   @State memoDraft: string = '';
@@ -361,6 +366,24 @@ struct Index {
     await this.reloadMonth();
   }
 
+  /** 把选中那天的日程写进系统日历 */
+  async exportDayCalendar(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const date = this.selDate.length > 0 ? this.selDate : this.today;
+      this.message = await exportDayToSystem(context, date);
+    } catch (err) {
+      this.message = `写入系统日历失败：${err}`;
+    }
+    try {
+      promptAction.showToast({ message: this.message, duration: 3000 });
+    } catch (e) {
+      // 忽略
+    }
+    await this.reloadDay();
+    await this.reloadMonth();
+  }
+
   /** 从电脑端导出的 .dlpk 数据包导入日程 */
   async importComputer(): Promise<void> {
     try {
@@ -520,7 +543,52 @@ struct Index {
     this.mailImapPort = await Db.getSetting('mail_imap_port', '993');
   }
 
+  /** 按邮箱域名填好 SMTP / IMAP 服务器（QQ、163、复旦、Gmail、Outlook） */
+  applyMailPreset(): void {
+    const addr = this.mailAddress.trim().toLowerCase();
+    const at = addr.indexOf('@');
+    const domain = at >= 0 ? addr.substring(at + 1) : '';
+    if (domain === 'qq.com' || domain === 'foxmail.com') {
+      this.mailSmtpHost = 'smtp.qq.com';
+      this.mailSmtpPort = '465';
+      this.mailImapHost = 'imap.qq.com';
+      this.mailImapPort = '993';
+      this.message = '已按 QQ 邮箱填好（授权码在 QQ 邮箱设置 → 账户里生成）';
+    } else if (domain === '163.com' || domain === '126.com') {
+      this.mailSmtpHost = domain === '126.com' ? 'smtp.126.com' : 'smtp.163.com';
+      this.mailSmtpPort = '465';
+      this.mailImapHost = domain === '126.com' ? 'imap.126.com' : 'imap.163.com';
+      this.mailImapPort = '993';
+      this.message = '已按网易邮箱填好（授权码在网页版设置里开启）';
+    } else if (domain.endsWith('fudan.edu.cn')) {
+      this.mailSmtpHost = 'smtp.fudan.edu.cn';
+      this.mailSmtpPort = '465';
+      this.mailImapHost = 'imap.fudan.edu.cn';
+      this.mailImapPort = '993';
+      this.message = '已按复旦邮箱填好（如果连不上，问一下信息办端口）';
+    } else if (domain === 'gmail.com') {
+      this.mailSmtpHost = 'smtp.gmail.com';
+      this.mailSmtpPort = '465';
+      this.mailImapHost = 'imap.gmail.com';
+      this.mailImapPort = '993';
+      this.message = '已按 Gmail 填好（需要应用专用密码）';
+    } else if (domain === 'outlook.com' || domain === 'hotmail.com' || domain === 'live.com') {
+      this.mailSmtpHost = 'smtp.office365.com';
+      this.mailSmtpPort = '587';
+      this.mailImapHost = 'outlook.office365.com';
+      this.mailImapPort = '993';
+      this.message = '已按 Outlook 填好；注意 587 是 STARTTLS，目前这版只支持 465 直连 TLS';
+    } else if (domain.length > 0) {
+      this.message = `不认识 ${domain} 的邮件服务器，请手动填 SMTP / IMAP`;
+    } else {
+      this.message = '先填完整邮箱地址';
+    }
+  }
+
   async saveMail(): Promise<void> {
+    if (this.mailSmtpHost.trim().length === 0 || this.mailImapHost.trim().length === 0) {
+      this.applyMailPreset();
+    }
     await Db.setSetting('mail_address', this.mailAddress.trim());
     await Db.setSetting('mail_auth', this.mailAuth.trim());
     await Db.setSetting('mail_smtp_host', this.mailSmtpHost.trim());
@@ -553,10 +621,46 @@ struct Index {
     this.mailBusy = true;
     this.message = '正在读收件箱…';
     try {
-      this.inboxText = await fetchInbox(5);
-      this.message = '收件箱已更新';
+      this.inboxList = await fetchInboxList(6);
+      this.inboxDetail = '';
+      this.message = this.inboxList.length > 0 ? `收件箱 ${this.inboxList.length} 封` : '收件箱是空的';
     } catch (err) {
-      this.message = `读收件箱失败：${err}`;
+      this.message = `读收件箱失败：${err instanceof Error ? err.message : err}`;
+    }
+    this.mailBusy = false;
+  }
+
+  async openMail(seq: number): Promise<void> {
+    if (this.mailBusy) {
+      return;
+    }
+    this.mailBusy = true;
+    this.message = `正在读第 ${seq} 封…`;
+    try {
+      this.inboxDetail = await fetchMailBody(seq);
+      this.message = '已打开';
+    } catch (err) {
+      this.message = `读邮件失败：${err instanceof Error ? err.message : err}`;
+    }
+    this.mailBusy = false;
+  }
+
+  async sendCompose(): Promise<void> {
+    const to = this.mailTo.trim();
+    if (to.length === 0) {
+      this.message = '收件人为空';
+      return;
+    }
+    if (this.mailBusy) {
+      return;
+    }
+    this.mailBusy = true;
+    this.message = '正在发送…';
+    try {
+      this.message = await sendMail(to, this.mailSubject.trim(), this.mailBody);
+      this.mailBody = '';
+    } catch (err) {
+      this.message = `发送失败：${err instanceof Error ? err.message : err}`;
     }
     this.mailBusy = false;
   }
@@ -1728,6 +1832,19 @@ struct Index {
         .borderRadius(10)
         .onChange((v: string) => { this.mailAuth = v; })
       Row({ space: 8 }) {
+        Text('QQ / 163 / 复旦 / Gmail 可一键填服务器')
+          .fontSize(11)
+          .fontColor('#8a8f98')
+          .layoutWeight(1)
+        Button('自动填服务器')
+          .height(32)
+          .fontSize(12)
+          .backgroundColor('#FBE9EC')
+          .fontColor('#c8546a')
+          .onClick(() => { this.applyMailPreset(); })
+      }
+      .width('100%')
+      Row({ space: 8 }) {
         TextInput({ text: this.mailSmtpHost, placeholder: 'SMTP 服务器' })
           .layoutWeight(1)
           .height(40)
@@ -1777,8 +1894,38 @@ struct Index {
           .onClick(() => { void this.previewInbox(); })
       }
       .width('100%')
-      if (this.inboxText.length > 0) {
-        Text(this.inboxText)
+      if (this.inboxList.length > 0) {
+        ForEach(this.inboxList, (h: MailHeader) => {
+          Row({ space: 8 }) {
+            Column({ space: 2 }) {
+              Text(h.subject.length > 0 ? h.subject : '（无主题）')
+                .fontSize(12)
+                .fontColor('#1f2328')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .width('100%')
+              Text(h.from)
+                .fontSize(11)
+                .fontColor('#9a9aa2')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .width('100%')
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+            Text(h.date.length > 16 ? h.date.substring(0, 16) : h.date)
+              .fontSize(10)
+              .fontColor('#b9bcc4')
+          }
+          .width('100%')
+          .padding(8)
+          .borderRadius(8)
+          .backgroundColor('#F7F7FA')
+          .onClick(() => { void this.openMail(h.index); })
+        }, (h: MailHeader) => `${h.index}`)
+      }
+      if (this.inboxDetail.length > 0) {
+        Text(this.inboxDetail)
           .fontSize(12)
           .fontColor('#3a3a40')
           .width('100%')
@@ -1786,6 +1933,29 @@ struct Index {
           .borderRadius(10)
           .backgroundColor('#F7F7FA')
       }
+
+      Text('写邮件').fontSize(12).fontColor('#5c6270').width('100%')
+      TextInput({ text: this.mailTo, placeholder: '收件人' })
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((v: string) => { this.mailTo = v; })
+      TextInput({ text: this.mailSubject, placeholder: '主题' })
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((v: string) => { this.mailSubject = v; })
+      TextArea({ text: this.mailBody, placeholder: '正文' })
+        .height(90)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((v: string) => { this.mailBody = v; })
+      Button(this.mailBusy ? '处理中…' : '发送')
+        .height(38)
+        .width('100%')
+        .fontSize(13)
+        .backgroundColor('#c8546a')
+        .onClick(() => { void this.sendCompose(); })
 
       Divider().color('#EFEFF3')
       Text('小工具（备忘 / 倒计时 / 闪卡）')
@@ -2140,6 +2310,13 @@ struct Index {
       .padding({ left: 12, right: 12, top: 10, bottom: 10 })
       .borderRadius(8)
       .onClick(() => { void this.importComputer(); })
+      Row() {
+        Text('导出当天到系统日历').fontSize(13).fontColor('#1f2328')
+      }
+      .width(180)
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .borderRadius(8)
+      .onClick(() => { void this.exportDayCalendar(); })
     }
     .width(180)
     .padding(6)

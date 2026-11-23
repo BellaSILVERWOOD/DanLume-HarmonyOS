@@ -93,6 +93,73 @@ export async function importSystemCalendar(context: common.UIAbilityContext): Pr
     : `没有新日程（读了 ${read} 条，都已在 DanLume 里）`;
 }
 
+/** 把 DanLume 里某一天的日程写进系统日历（标题重复的跳过） */
+export async function exportDayToSystem(context: common.UIAbilityContext, date: string): Promise<string> {
+  const at = abilityAccessCtrl.createAtManager();
+  const wanted: Permissions[] = ['ohos.permission.WRITE_CALENDAR'];
+  const res = await at.requestPermissionsFromUser(context, wanted);
+  if (res.authResults.length === 0 || res.authResults[0] !== 0) {
+    return '没有日历写入权限：设置 → 应用和元服务 → DanLume → 权限 → 日历，改成允许';
+  }
+  const rows = await Db.eventsOn(date);
+  if (rows.length === 0) {
+    return `${date} 没有日程可写`;
+  }
+  const mgr = calendarManager.getCalendarManager(context);
+  const calendars = await mgr.getAllCalendars();
+  if (calendars.length === 0) {
+    return '系统里还没有任何日历账户';
+  }
+  const cal = calendars[0];
+  // 已经写过的（同一天同标题）跳过，避免重复
+  const existing: string[] = [];
+  try {
+    const dayStart = new Date(`${date}T00:00:00`).getTime();
+    const dayEnd = dayStart + 24 * 3600 * 1000;
+    const events = await cal.getEvents(calendarManager.EventFilter.filterByTime(dayStart, dayEnd));
+    for (const ev of events) {
+      existing.push(`${ev.title ?? ''}`);
+    }
+  } catch (e) {
+    // 读不到就当没有
+  }
+  let added = 0;
+  let skipped = 0;
+  for (const row of rows) {
+    if (existing.includes(row.title)) {
+      skipped += 1;
+      continue;
+    }
+    const allDay = row.start_time.length === 0;
+    const start = allDay
+      ? new Date(`${row.date}T00:00:00`).getTime()
+      : new Date(`${row.date}T${row.start_time}:00`).getTime();
+    let end = 0;
+    if (allDay) {
+      end = start + 24 * 3600 * 1000 - 60000;
+    } else if (row.end_time.length > 0) {
+      end = new Date(`${row.date}T${row.end_time}:00`).getTime();
+    } else {
+      end = start + 3600 * 1000;
+    }
+    const event: calendarManager.Event = {
+      type: calendarManager.EventType.NORMAL,
+      title: row.title,
+      startTime: start,
+      endTime: end,
+      isAllDay: allDay,
+      description: row.description,
+    };
+    try {
+      await cal.addEvent(event);
+      added += 1;
+    } catch (e) {
+      console.error(`[cal] addEvent failed: ${e}`);
+    }
+  }
+  return `写入系统日历 ${added} 条（重复跳过 ${skipped} 条）`;
+}
+
 function findDbFile(dir: string): string {
   const names = fs.listFileSync(dir);
   for (const name of names) {
