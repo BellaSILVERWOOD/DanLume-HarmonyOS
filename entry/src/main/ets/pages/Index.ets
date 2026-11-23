@@ -14,6 +14,14 @@ interface EventItem {
   done: boolean;
 }
 
+/** 服务器公告（/api/v1/announcements 的 items 里用到的字段） */
+interface NoticeItem {
+  id: number;
+  title: string;
+  body: string;
+  created_at: string;
+}
+
 @Entry
 @Component
 struct Index {
@@ -21,15 +29,29 @@ struct Index {
   @State currentTab: number = 0;
   @State today: string = Db.today();
   @State events: EventItem[] = [];
-  @State draft: string = '';
+  // 每个标签页各自的输入内容，别共用一个 draft（会在页面之间串）
+  @State todayDraft: string = '';
+  @State chatDraft: string = '';
   @State chat: ChatLine[] = [];
   @State asking: boolean = false;
   @State accountName: string = '';
+  @State loginUser: string = '';
+  @State loginPwd: string = '';
   @State message: string = '';
+  // AI 接口（OpenAI 兼容）：和桌面版一样存在本地设置里
+  @State aiBase: string = '';
+  @State aiModel: string = '';
+  @State aiKey: string = '';
+  @State serverUrl: string = '';
+  @State notices: NoticeItem[] = [];
+  // 行内编辑：editingId 是正在编辑的日程 id（0 = 没有在编辑）
+  @State editingId: number = 0;
+  @State editingTitle: string = '';
 
   aboutToAppear(): void {
     this.reloadToday();
     this.reloadAccount();
+    this.reloadAi();
   }
 
   // ------------------------------------------------------------ 数据
@@ -45,14 +67,68 @@ struct Index {
     this.accountName = await Db.getSetting('server_username', '');
   }
 
+  async reloadAi(): Promise<void> {
+    this.serverUrl = await Db.getSetting('server_url', 'https://43.108.99.38.sslip.io');
+    this.aiBase = await Db.getSetting('ai_base_url', 'https://api.deepseek.com/v1');
+    this.aiModel = await Db.getSetting('ai_model', 'deepseek-chat');
+    this.aiKey = await Db.getSetting('ai_api_key', '');
+  }
+
+  async saveAi(): Promise<void> {
+    const server = this.serverUrl.trim().length > 0
+      ? this.serverUrl.trim() : 'https://43.108.99.38.sslip.io';
+    const base = this.aiBase.trim().length > 0 ? this.aiBase.trim() : 'https://api.deepseek.com/v1';
+    const model = this.aiModel.trim().length > 0 ? this.aiModel.trim() : 'deepseek-chat';
+    this.serverUrl = server;
+    this.aiBase = base;
+    this.aiModel = model;
+    await Db.setSetting('server_url', server);
+    await Db.setSetting('ai_base_url', base);
+    await Db.setSetting('ai_model', model);
+    await Db.setSetting('ai_api_key', this.aiKey.trim());
+    this.message = this.aiKey.trim().length > 0 ? '设置已保存' : '设置已保存（还没填 API Key）';
+  }
+
+  async removeEvent(id: number): Promise<void> {
+    await Db.deleteEvent(id);
+    this.message = '已删除';
+    await this.reloadToday();
+  }
+
+  async saveEdit(id: number): Promise<void> {
+    const title = this.editingTitle.trim();
+    if (title.length > 0) {
+      await Db.renameEvent(id, title);
+    }
+    this.editingId = 0;
+    this.editingTitle = '';
+    await this.reloadToday();
+  }
+
+  /** 选一个日期看当天日程（不选就一直看今天） */
+  pickDate(): void {
+    DatePickerDialog.show({
+      start: new Date('2020-01-01'),
+      end: new Date('2035-12-31'),
+      selected: new Date(this.today),
+      onDateAccept: (value: Date) => {
+        const y = value.getFullYear();
+        const m = `${value.getMonth() + 1}`.padStart(2, '0');
+        const d = `${value.getDate()}`.padStart(2, '0');
+        this.today = `${y}-${m}-${d}`;
+        this.reloadToday();
+      },
+    });
+  }
+
   async addQuickEvent(): Promise<void> {
-    const title = this.draft.trim();
+    const title = this.todayDraft.trim();
     if (title.length === 0) {
       this.message = '先写个标题';
       return;
     }
     await Db.addEvent({ title: title, date: this.today });
-    this.draft = '';
+    this.todayDraft = '';
     this.message = '已加进今天';
     await this.reloadToday();
   }
@@ -63,7 +139,7 @@ struct Index {
   }
 
   async askMeizi(): Promise<void> {
-    const text = this.draft.trim();
+    const text = this.chatDraft.trim();
     if (text.length === 0 || this.asking) {
       return;
     }
@@ -76,7 +152,7 @@ struct Index {
       }
     }
     this.chat.push({ role: 'user', text: text });
-    this.draft = '';
+    this.chatDraft = '';
     try {
       const answer = await Api.chat(text, history);
       this.chat.push({ role: 'assistant', text: answer });
@@ -88,22 +164,17 @@ struct Index {
   }
 
   async doLogin(): Promise<void> {
-    const user = this.draft.trim();
-    if (user.length === 0) {
-      this.message = '先在输入框里写用户名';
-      return;
-    }
-    // 骨架版：密码也在同一个输入框里用「用户名,密码」格式输入，正式版要换成两个输入框
-    const parts = user.split(',');
-    if (parts.length < 2) {
-      this.message = '格式：用户名,密码';
+    const user = this.loginUser.trim();
+    const pwd = this.loginPwd;
+    if (user.length === 0 || pwd.length === 0) {
+      this.message = '用户名和密码都要填';
       return;
     }
     try {
-      const result = await Api.login(parts[0].trim(), parts[1].trim());
+      const result = await Api.login(user, pwd);
       this.accountName = result.username;
       this.message = `已登录 ${result.username}`;
-      this.draft = '';
+      this.loginPwd = '';
     } catch (err) {
       this.message = `登录失败：${err}`;
     }
@@ -111,20 +182,51 @@ struct Index {
 
   async pullAnnouncements(): Promise<void> {
     const items = await Api.announcements(0);
-    this.message = items.length > 0 ? `拉到 ${items.length} 条公告` : '没有新公告';
+    const rows: NoticeItem[] = [];
+    for (const item of items) {
+      const obj = item as Record<string, Object>;
+      const idText = `${obj['id'] ?? ''}`;
+      const id = parseInt(idText, 10);
+      rows.push({
+        id: isNaN(id) ? 0 : id,
+        title: `${obj['title'] ?? ''}`,
+        body: `${obj['body'] ?? ''}`,
+        created_at: `${obj['created_at'] ?? ''}`,
+      });
+    }
+    this.notices = rows;
+    this.message = rows.length > 0 ? `拉到 ${rows.length} 条公告` : '没有新公告';
   }
 
   // ------------------------------------------------------------ 界面
   @Builder
   todayTab() {
     Column({ space: 12 }) {
-      Text(this.today).fontSize(13).fontColor('#8a8f98').width('100%')
       Row({ space: 8 }) {
-        TextInput({ text: this.draft, placeholder: '今天要做的事…' })
+        Text(this.today).fontSize(13).fontColor('#8a8f98').layoutWeight(1)
+        Button('今天')
+          .height(28)
+          .fontSize(12)
+          .backgroundColor('#eeeeee')
+          .fontColor('#2b2f36')
+          .onClick(() => {
+            this.today = Db.today();
+            this.reloadToday();
+          })
+        Button('选日期')
+          .height(28)
+          .fontSize(12)
+          .backgroundColor('#eeeeee')
+          .fontColor('#2b2f36')
+          .onClick(() => { this.pickDate(); })
+      }
+      .width('100%')
+      Row({ space: 8 }) {
+        TextInput({ text: this.todayDraft, placeholder: '今天要做的事…' })
           .layoutWeight(1)
           .height(40)
           .borderRadius(10)
-          .onChange((value: string) => { this.draft = value; })
+          .onChange((value: string) => { this.todayDraft = value; })
         Button('加进日程')
           .height(40)
           .backgroundColor('#c8546a')
@@ -145,13 +247,50 @@ struct Index {
                 .fontColor(item.done ? '#3f9e6a' : '#8a8f98')
                 .onClick(() => { void this.toggleDone(item.id, item.done); })
               Column({ space: 2 }) {
-                Text(item.title).fontSize(15).decoration({ type: item.done ? TextDecorationType.LineThrough : TextDecorationType.None })
+                if (this.editingId === item.id) {
+                  TextInput({ text: this.editingTitle })
+                    .height(32)
+                    .width('100%')
+                    .borderRadius(8)
+                    .onChange((value: string) => { this.editingTitle = value; })
+                } else {
+                  Text(item.title).fontSize(15).decoration({ type: item.done ? TextDecorationType.LineThrough : TextDecorationType.None })
+                }
                 if (item.start.length > 0) {
                   Text(item.start).fontSize(12).fontColor('#8a8f98')
                 }
               }
               .alignItems(HorizontalAlign.Start)
               .layoutWeight(1)
+              if (this.editingId === item.id) {
+                Text('保存')
+                  .fontSize(12)
+                  .fontColor('#3f9e6a')
+                  .padding({ left: 6, right: 2 })
+                  .onClick(() => { void this.saveEdit(item.id); })
+                Text('取消')
+                  .fontSize(12)
+                  .fontColor('#8a8f98')
+                  .padding({ left: 6, right: 2 })
+                  .onClick(() => {
+                    this.editingId = 0;
+                    this.editingTitle = '';
+                  })
+              } else {
+                Text('编辑')
+                  .fontSize(12)
+                  .fontColor('#8a8f98')
+                  .padding({ left: 6, right: 2 })
+                  .onClick(() => {
+                    this.editingId = item.id;
+                    this.editingTitle = item.title;
+                  })
+                Text('删除')
+                  .fontSize(12)
+                  .fontColor('#c8546a')
+                  .padding({ left: 6, right: 2 })
+                  .onClick(() => { void this.removeEvent(item.id); })
+              }
             }
             .width('100%')
             .padding(12)
@@ -191,11 +330,11 @@ struct Index {
       .width('100%')
 
       Row({ space: 8 }) {
-        TextInput({ text: this.draft, placeholder: '跟梅子说点什么…' })
+        TextInput({ text: this.chatDraft, placeholder: '跟梅子说点什么…' })
           .layoutWeight(1)
           .height(40)
           .borderRadius(10)
-          .onChange((value: string) => { this.draft = value; })
+          .onChange((value: string) => { this.chatDraft = value; })
         Button(this.asking ? '…' : '发送')
           .height(40)
           .backgroundColor('#c8546a')
@@ -215,17 +354,24 @@ struct Index {
       Text(this.accountName.length > 0 ? `已登录：${this.accountName}` : '还没登录账号')
         .fontSize(14)
         .width('100%')
-      Text('输入「用户名,密码」后点登录（骨架版省了两个输入框）')
+      Text('用 DanLume 账号登录；忘记密码可用注册邮箱在网页版找回')
         .fontSize(12)
         .fontColor('#8a8f98')
         .width('100%')
+      TextInput({ text: this.loginUser, placeholder: '学号 / 用户名' })
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((value: string) => { this.loginUser = value; })
+      TextInput({ text: this.loginPwd, placeholder: '密码' })
+        .type(InputType.Password)
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((value: string) => { this.loginPwd = value; })
       Row({ space: 8 }) {
-        TextInput({ text: this.draft, placeholder: '用户名,密码' })
-          .layoutWeight(1)
-          .height(40)
-          .borderRadius(10)
-          .onChange((value: string) => { this.draft = value; })
         Button('登录')
+          .layoutWeight(1)
           .height(40)
           .backgroundColor('#c8546a')
           .onClick(() => { void this.doLogin(); })
@@ -238,6 +384,66 @@ struct Index {
         .backgroundColor('#eeeeee')
         .fontColor('#2b2f36')
         .onClick(() => { void this.pullAnnouncements(); })
+
+      Text('服务器地址')
+        .fontSize(13)
+        .fontWeight(500)
+        .width('100%')
+      TextInput({ text: this.serverUrl, placeholder: 'https://43.108.99.38.sslip.io' })
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((value: string) => { this.serverUrl = value; })
+
+      Text('AI 接口（OpenAI 兼容，DeepSeek 等）')
+        .fontSize(13)
+        .fontWeight(500)
+        .width('100%')
+      TextInput({ text: this.aiBase, placeholder: '接口地址，如 https://api.deepseek.com/v1' })
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((value: string) => { this.aiBase = value; })
+      TextInput({ text: this.aiModel, placeholder: '模型名，如 deepseek-chat' })
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((value: string) => { this.aiModel = value; })
+      TextInput({ text: this.aiKey, placeholder: 'API Key' })
+        .type(InputType.Password)
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((value: string) => { this.aiKey = value; })
+      Button('保存服务器与 AI 设置')
+        .height(40)
+        .width('100%')
+        .backgroundColor('#eeeeee')
+        .fontColor('#2b2f36')
+        .onClick(() => { void this.saveAi(); })
+
+      if (this.notices.length > 0) {
+        Text('公告')
+          .fontSize(13)
+          .fontWeight(500)
+          .width('100%')
+        ForEach(this.notices, (notice: NoticeItem) => {
+          Column({ space: 2 }) {
+            Text(notice.title).fontSize(14).width('100%')
+            Text(notice.body)
+              .fontSize(12)
+              .fontColor('#8a8f98')
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+          }
+          .alignItems(HorizontalAlign.Start)
+          .width('100%')
+          .padding(10)
+          .borderRadius(10)
+          .backgroundColor('#ffffff')
+        }, (notice: NoticeItem) => `${notice.id}`)
+      }
 
       if (this.message.length > 0) {
         Text(this.message).fontSize(12).fontColor('#c8546a').width('100%')
@@ -254,7 +460,11 @@ struct Index {
       TabContent() { this.chatTab() }.tabBar('梅子')
       TabContent() { this.meTab() }.tabBar('我的')
     }
-    .onChange((index: number) => { this.currentTab = index; })
+    .onChange((index: number) => {
+      this.currentTab = index;
+      // 提示是三个标签页共用的：切页时清掉，免得「登录失败」跑到「今日」上
+      this.message = '';
+    })
     .barPosition(BarPosition.End)
     .width('100%')
     .height('100%')

@@ -155,6 +155,10 @@ export class Db {
     await Db.need().executeSql('DELETE FROM events WHERE id = ?', [id]);
   }
 
+  static async renameEvent(id: number, title: string): Promise<void> {
+    await Db.need().executeSql('UPDATE events SET title = ? WHERE id = ?', [title, id]);
+  }
+
   /** 本地时间戳，和桌面版 now_str() 一个格式 */
   static stamp(): string {
     const now = new Date();
