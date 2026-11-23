@@ -1,5 +1,6 @@
 import { Db, EventRow } from '../common/Db';
 import { Api, PaperHit } from '../common/Api';
+import common from '@ohos.app.ability.common';
 
 interface ChatLine {
   role: 'user' | 'assistant';
@@ -302,6 +303,25 @@ struct Index {
     }
   }
 
+  /** 用系统浏览器打开 PDF / 原文（不需要额外权限） */
+  openLink(url: string): void {
+    if (url.length === 0) {
+      return;
+    }
+    const context = getContext(this) as common.UIAbilityContext;
+    context.startAbility({
+      action: 'ohos.want.action.viewData',
+      uri: url,
+    }).catch((err: Error) => {
+      this.message = `打不开链接：${err.message}`;
+    });
+  }
+
+  clearChat(): void {
+    this.chat = [];
+    this.message = '对话已清空';
+  }
+
   // ------------------------------------------------------------ 界面
   @Builder
   todayTab() {
@@ -414,6 +434,16 @@ struct Index {
   @Builder
   chatTab() {
     Column({ space: 10 }) {
+      Row() {
+        Text('和梅子的对话').fontSize(13).fontColor('#8a8f98').layoutWeight(1)
+        Button('清空')
+          .height(26)
+          .fontSize(12)
+          .backgroundColor('#eeeeee')
+          .fontColor('#2b2f36')
+          .onClick(() => { this.clearChat(); })
+      }
+      .width('100%')
       List({ space: 8 }) {
         ForEach(this.chat, (line: ChatLine, index: number) => {
           ListItem() {
@@ -602,6 +632,7 @@ struct Index {
             .padding(10)
             .borderRadius(10)
             .backgroundColor('#ffffff')
+            .onClick(() => { this.openLink(paper.url); })
           }
         }, (paper: PaperHit) => paper.url + paper.title)
       }
