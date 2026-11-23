@@ -27,6 +27,7 @@ export interface EventRow {
   remind_minutes: number;
   color: string;
   done: boolean;
+  reminder_id: number;
 }
 
 /** 新建日程的入参（ArkTS 不允许把对象字面量直接当类型，必须显式声明） */
@@ -72,6 +73,24 @@ export class Db {
     for (const sql of SCHEMA) {
       await store.executeSql(sql);
     }
+    await Db.ensureReminderColumn();
+  }
+
+  /** 老库补 `reminder_id` 列（CREATE TABLE IF NOT EXISTS 不会改已存在的表） */
+  private static async ensureReminderColumn(): Promise<void> {
+    const db = Db.need();
+    let has = false;
+    const rows = await db.querySql('PRAGMA table_info(events)');
+    while (rows.goToNextRow()) {
+      const name = rows.getString(rows.getColumnIndex('name'));
+      if (name === 'reminder_id') {
+        has = true;
+      }
+    }
+    rows.close();
+    if (!has) {
+      await db.executeSql('ALTER TABLE events ADD COLUMN reminder_id INTEGER NOT NULL DEFAULT 0');
+    }
   }
 
   private static need(): relationalStore.RdbStore {
@@ -109,7 +128,7 @@ export class Db {
     predicates.equalTo('date', date).orderByAsc('start_time');
     const rows = await Db.need().query(predicates, [
       'id', 'title', 'description', 'date', 'start_time', 'end_time',
-      'remind_minutes', 'color', 'done',
+      'remind_minutes', 'color', 'done', 'reminder_id',
     ]);
     const out: EventRow[] = [];
     while (rows.goToNextRow()) {
@@ -123,6 +142,7 @@ export class Db {
         remind_minutes: rows.getLong(rows.getColumnIndex('remind_minutes')),
         color: rows.getString(rows.getColumnIndex('color')),
         done: rows.getLong(rows.getColumnIndex('done')) === 1,
+        reminder_id: rows.getLong(rows.getColumnIndex('reminder_id')),
       });
     }
     rows.close();
@@ -135,7 +155,7 @@ export class Db {
     predicates.like('date', `${month}-%`).orderByAsc('date');
     const rows = await Db.need().query(predicates, [
       'id', 'title', 'description', 'date', 'start_time', 'end_time',
-      'remind_minutes', 'color', 'done',
+      'remind_minutes', 'color', 'done', 'reminder_id',
     ]);
     const out: EventRow[] = [];
     while (rows.goToNextRow()) {
@@ -149,6 +169,7 @@ export class Db {
         remind_minutes: rows.getLong(rows.getColumnIndex('remind_minutes')),
         color: rows.getString(rows.getColumnIndex('color')),
         done: rows.getLong(rows.getColumnIndex('done')) === 1,
+        reminder_id: rows.getLong(rows.getColumnIndex('reminder_id')),
       });
     }
     rows.close();
@@ -183,6 +204,11 @@ export class Db {
 
   static async renameEvent(id: number, title: string): Promise<void> {
     await Db.need().executeSql('UPDATE events SET title = ? WHERE id = ?', [title, id]);
+  }
+
+  /** 记下系统提醒 id（0 = 没设提醒） */
+  static async setReminderId(id: number, reminderId: number): Promise<void> {
+    await Db.need().executeSql('UPDATE events SET reminder_id = ? WHERE id = ?', [reminderId, id]);
   }
 
   /** 本地时间戳，和桌面版 now_str() 一个格式 */

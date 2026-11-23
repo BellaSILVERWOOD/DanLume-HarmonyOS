@@ -1,6 +1,8 @@
 import { Db, EventRow } from '../common/Db';
 import { Api, PaperHit } from '../common/Api';
 import common from '@ohos.app.ability.common';
+import reminderAgentManager from '@ohos.reminderAgentManager';
+import notificationManager from '@ohos.notificationManager';
 
 interface ChatLine {
   role: 'user' | 'assistant';
@@ -13,6 +15,7 @@ interface EventItem {
   title: string;
   start: string;
   done: boolean;
+  reminderId: number;
 }
 
 /** 服务器公告（/api/v1/announcements 的 items 里用到的字段） */
@@ -79,7 +82,13 @@ struct Index {
   async reloadToday(): Promise<void> {
     const rows = await Db.eventsOn(this.today);
     this.events = rows.map((row): EventItem => {
-      const item: EventItem = { id: row.id, title: row.title, start: row.start_time, done: row.done };
+      const item: EventItem = {
+        id: row.id,
+        title: row.title,
+        start: row.start_time,
+        done: row.done,
+        reminderId: row.reminder_id,
+      };
       return item;
     });
   }
@@ -187,6 +196,51 @@ struct Index {
     }
     this.editingId = 0;
     this.editingTitle = '';
+    await this.reloadToday();
+  }
+
+  /** 给这一天的日程设/取消系统提醒（reminderAgent，到点弹系统通知） */
+  async toggleReminder(item: EventItem): Promise<void> {
+    if (item.reminderId > 0) {
+      try {
+        await reminderAgentManager.cancelReminder(item.reminderId);
+      } catch (err) {
+        // 提醒可能已经被系统清理；本地标记照样清掉
+      }
+      await Db.setReminderId(item.id, 0);
+      this.message = '已取消提醒';
+      await this.reloadToday();
+      return;
+    }
+    const start = item.start.length >= 5 ? item.start : '09:00';
+    const y = parseInt(this.today.slice(0, 4), 10);
+    const m = parseInt(this.today.slice(5, 7), 10);
+    const d = parseInt(this.today.slice(8, 10), 10);
+    const hour = parseInt(start.slice(0, 2), 10);
+    const minute = parseInt(start.slice(3, 5), 10);
+    const context = getContext(this) as common.UIAbilityContext;
+    try {
+      await notificationManager.requestEnableNotification(context);
+    } catch (err) {
+      // 用户拒绝通知权限时发布提醒会失败，下面会给出提示
+    }
+    const request: reminderAgentManager.ReminderRequestCalendar = {
+      reminderType: reminderAgentManager.ReminderType.REMINDER_TYPE_CALENDAR,
+      dateTime: { year: y, month: m, day: d, hour: hour, minute: minute, second: 0 },
+      title: '日程提醒',
+      content: item.title,
+      expiredContent: item.title,
+      snoozeTimes: 0,
+      ringDuration: 5,
+      wantAgent: { pkgName: 'com.danlume.app.harmony', abilityName: 'EntryAbility' },
+    };
+    try {
+      const reminderId = await reminderAgentManager.publishReminder(request);
+      await Db.setReminderId(item.id, reminderId);
+      this.message = `已设提醒 ${start}`;
+    } catch (err) {
+      this.message = `设提醒失败：${err}`;
+    }
     await this.reloadToday();
   }
 
@@ -401,6 +455,11 @@ struct Index {
                     this.editingTitle = '';
                   })
               } else {
+                Text(item.reminderId > 0 ? '取消提醒' : '提醒')
+                  .fontSize(12)
+                  .fontColor(item.reminderId > 0 ? '#c8546a' : '#3f9e6a')
+                  .padding({ left: 6, right: 2 })
+                  .onClick(() => { void this.toggleReminder(item); })
                 Text('编辑')
                   .fontSize(12)
                   .fontColor('#8a8f98')
