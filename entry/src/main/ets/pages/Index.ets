@@ -3,6 +3,9 @@ import { Api, PaperHit } from '../common/Api';
 import common from '@ohos.app.ability.common';
 import reminderAgentManager from '@ohos.reminderAgentManager';
 import notificationManager from '@ohos.notificationManager';
+import { speechRecognizer } from '@kit.CoreSpeechKit';
+import abilityAccessCtrl, { Permissions } from '@ohos.abilityAccessCtrl';
+import pasteboard from '@ohos.pasteboard';
 
 interface ChatLine {
   role: 'user' | 'assistant';
@@ -67,6 +70,9 @@ struct Index {
   @State paperQuery: string = '';
   @State papers: PaperHit[] = [];
   @State paperBusy: boolean = false;
+  @State listening: boolean = false;
+  // 语音识别引擎（第一次用时创建，之后复用）
+  asrEngine: speechRecognizer.SpeechRecognitionEngine | null = null;
 
   aboutToAppear(): void {
     this.reloadToday();
@@ -376,6 +382,127 @@ struct Index {
     this.message = '对话已清空';
   }
 
+  copyText(text: string): void {
+    const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+    pasteboard.getSystemPasteboard().setData(data).then(() => {
+      this.message = '已复制';
+    }).catch((err: Error) => {
+      this.message = `复制失败：${err.message}`;
+    });
+  }
+
+  /** 重新生成上一条回答（保留问题，去掉末尾那条助手回复） */
+  async regenerate(): Promise<void> {
+    if (this.asking) {
+      return;
+    }
+    let lastUser = '';
+    for (let i = this.chat.length - 1; i >= 0; i -= 1) {
+      if (this.chat[i].role === 'user') {
+        lastUser = this.chat[i].text;
+        break;
+      }
+    }
+    if (lastUser.length === 0) {
+      return;
+    }
+    if (this.chat.length > 0 && this.chat[this.chat.length - 1].role === 'assistant') {
+      this.chat.pop();
+    }
+    const history: string[] = [];
+    for (const line of this.chat) {
+      if (line.role === 'user') {
+        history.push(line.text);
+      }
+    }
+    this.asking = true;
+    try {
+      const answer = await Api.chat(lastUser, history);
+      this.chat.push({ role: 'assistant', text: answer });
+    } catch (err) {
+      this.chat.push({ role: 'assistant', text: `出错了：${err}` });
+    } finally {
+      this.asking = false;
+    }
+  }
+
+  /** 语音输入：华为 Core Speech Kit（离线中文），结果直接填进输入框 */
+  async toggleVoice(): Promise<void> {
+    if (this.listening) {
+      if (this.asrEngine !== null) {
+        this.asrEngine.cancel('danlume-asr');
+      }
+      this.listening = false;
+      this.message = '已停止语音输入';
+      return;
+    }
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const atManager = abilityAccessCtrl.createAtManager();
+      const wanted: Permissions[] = ['ohos.permission.MICROPHONE'];
+      const result = await atManager.requestPermissionsFromUser(context, wanted);
+      if (result.authResults.length === 0 || result.authResults[0] !== 0) {
+        this.message = '没有麦克风权限，没法语音输入';
+        return;
+      }
+      if (this.asrEngine === null) {
+        const extra: Record<string, Object> = {
+          'locate': 'CN',
+          'recognizerMode': 'short',
+        };
+        const params: speechRecognizer.CreateEngineParams = {
+          language: 'zh-CN',
+          online: 1,
+          extraParams: extra,
+        };
+        this.asrEngine = await speechRecognizer.createEngine(params);
+        this.asrEngine.setListener({
+          onStart: (sessionId: string, eventMessage: string) => {
+            this.listening = true;
+            this.message = '正在听…再点麦克风结束';
+          },
+          onEvent: (sessionId: string, eventCode: number, eventMessage: string) => {
+          },
+          onResult: (sessionId: string, recognition: speechRecognizer.SpeechRecognitionResult) => {
+            if (recognition.result.trim().length > 0) {
+              this.chatDraft = recognition.result;
+            }
+          },
+          onComplete: (sessionId: string, eventMessage: string) => {
+            this.listening = false;
+          },
+          onError: (sessionId: string, errorCode: number, errorMessage: string) => {
+            this.listening = false;
+            this.message = `语音识别失败（${errorCode}）`;
+          },
+        });
+      }
+      const audio: speechRecognizer.AudioInfo = {
+        audioType: 'pcm',
+        sampleRate: 16000,
+        soundChannel: 1,
+        sampleBit: 16,
+      };
+      const startExtra: Record<string, Object> = {
+        'recognitionMode': 0,
+        'vadBegin': 2000,
+        'vadEnd': 3000,
+        'maxAudioDuration': 30000,
+      };
+      const startParams: speechRecognizer.StartParams = {
+        sessionId: 'danlume-asr',
+        audioInfo: audio,
+        extraParams: startExtra,
+      };
+      this.asrEngine.startListening(startParams);
+      this.listening = true;
+      this.message = '正在听…再点麦克风结束';
+    } catch (err) {
+      this.listening = false;
+      this.message = `语音输入不可用：${err}`;
+    }
+  }
+
   // ------------------------------------------------------------ 界面
   @Builder
   todayTab() {
@@ -478,7 +605,8 @@ struct Index {
             .width('100%')
             .padding(12)
             .borderRadius(12)
-            .backgroundColor('#ffffff')
+            .backgroundColor('#D9FFFFFF')
+            .backgroundBlurStyle(BlurStyle.Thin)
           }
         }, (item: EventItem) => `${item.id}`)
       }
@@ -493,48 +621,112 @@ struct Index {
   @Builder
   chatTab() {
     Column({ space: 10 }) {
-      Row() {
-        Text('和梅子的对话').fontSize(13).fontColor('#8a8f98').layoutWeight(1)
-        Button('清空')
-          .height(26)
-          .fontSize(12)
-          .backgroundColor('#eeeeee')
-          .fontColor('#2b2f36')
+      Row({ space: 8 }) {
+        Text('☰').fontSize(20).fontColor('#3a3a40').width(36).textAlign(TextAlign.Center)
+        Text('梅子').fontSize(16).fontWeight(600).layoutWeight(1).textAlign(TextAlign.Center)
+        Text('✎')
+          .fontSize(18)
+          .fontColor('#3a3a40')
+          .width(36)
+          .textAlign(TextAlign.Center)
           .onClick(() => { this.clearChat(); })
       }
       .width('100%')
-      List({ space: 8 }) {
-        ForEach(this.chat, (line: ChatLine, index: number) => {
-          ListItem() {
-            Row() {
-              Text(line.text)
-                .fontSize(14)
-                .padding(10)
-                .borderRadius(10)
-                .backgroundColor(line.role === 'user' ? '#f6dfe4' : '#ffffff')
-                .width('100%')
-            }
-            .width('100%')
-            .justifyContent(line.role === 'user' ? FlexAlign.End : FlexAlign.Start)
-          }
-        }, (line: ChatLine, index: number) => `${index}`)
-      }
-      .layoutWeight(1)
-      .width('100%')
 
-      Row({ space: 8 }) {
-        TextInput({ text: this.chatDraft, placeholder: '跟梅子说点什么…' })
+      if (this.chat.length === 0) {
+        Column({ space: 8 }) {
+          Text('有什么可以帮你？').fontSize(22).fontWeight(600).fontColor('#2b2f36')
+          Text('问日程、作业、文献，或直接说「帮我写…」').fontSize(13).fontColor('#8a8f98')
+        }
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+        .width('100%')
+      } else {
+        List({ space: 12 }) {
+          ForEach(this.chat, (line: ChatLine, index: number) => {
+            ListItem() {
+              Column({ space: 4 }) {
+                Row() {
+                  Text(line.text)
+                    .fontSize(15)
+                    .lineHeight(22)
+                    .padding(line.role === 'user' ? 12 : 0)
+                    .borderRadius(20)
+                    .backgroundColor(line.role === 'user' ? '#E7E1FB' : Color.Transparent)
+                    .constraintSize({ maxWidth: '84%' })
+                }
+                .width('100%')
+                .justifyContent(line.role === 'user' ? FlexAlign.End : FlexAlign.Start)
+                if (line.role === 'assistant') {
+                  Row({ space: 16 }) {
+                    Text('复制')
+                      .fontSize(12)
+                      .fontColor('#8a8f98')
+                      .onClick(() => { this.copyText(line.text); })
+                    Text('重新生成')
+                      .fontSize(12)
+                      .fontColor('#8a8f98')
+                      .onClick(() => { void this.regenerate(); })
+                  }
+                  .width('100%')
+                }
+              }
+              .width('100%')
+            }
+          }, (line: ChatLine, index: number) => `${index}`)
+        }
+        .layoutWeight(1)
+        .width('100%')
+      }
+
+      // 发送框：磨砂玻璃胶囊（对标 ChatGPT：+ / 输入 / 语音 / ↑）
+      Row({ space: 6 }) {
+        Stack() {
+          Text('+').fontSize(22).fontColor('#3a3a40')
+        }
+        .width(36)
+        .height(36)
+        .borderRadius(18)
+        .backgroundColor('#59FFFFFF')
+        .backgroundBlurStyle(BlurStyle.Regular)
+        .onClick(() => { this.message = '附件功能待接入'; })
+        TextInput({ text: this.chatDraft, placeholder: 'Ask 梅子…' })
           .layoutWeight(1)
-          .height(40)
-          .borderRadius(10)
+          .height(44)
+          .fontSize(15)
+          .backgroundColor(Color.Transparent)
           .onChange((value: string) => { this.chatDraft = value; })
-        Button(this.asking ? '…' : '发送')
-          .height(40)
-          .backgroundColor('#c8546a')
-          .enabled(!this.asking)
-          .onClick(() => { void this.askMeizi(); })
+        Stack() {
+          Text(this.listening ? '停' : '语音')
+            .fontSize(this.listening ? 14 : 11)
+            .fontColor('#3a3a40')
+        }
+        .width(36)
+        .height(36)
+        .borderRadius(18)
+        .backgroundColor(this.listening ? '#59FFD9D9' : '#59FFFFFF')
+        .backgroundBlurStyle(BlurStyle.Regular)
+        .onClick(() => { void this.toggleVoice(); })
+        Stack() {
+          Text(this.asking ? '…' : '↑').fontSize(18).fontColor(Color.White)
+        }
+        .width(36)
+        .height(36)
+        .borderRadius(18)
+        .backgroundColor(this.chatDraft.trim().length > 0 ? '#0A84FF' : '#C7C7CC')
+        .onClick(() => {
+          if (!this.asking) {
+            void this.askMeizi();
+          }
+        })
       }
       .width('100%')
+      .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+      .borderRadius(26)
+      .backgroundColor('#59FFFFFF')
+      .backgroundBlurStyle(BlurStyle.Regular)
+      .border({ width: 1, color: '#66FFFFFF' })
+      .shadow({ radius: 18, color: '#1A2A2A40', offsetY: 6 })
     }
     .padding(16)
     .width('100%')
@@ -634,7 +826,8 @@ struct Index {
           .width('100%')
           .padding(10)
           .borderRadius(10)
-          .backgroundColor('#ffffff')
+          .backgroundColor('#D9FFFFFF')
+          .backgroundBlurStyle(BlurStyle.Thin)
         }, (notice: NoticeItem) => `${notice.id}`)
       }
 
@@ -690,7 +883,8 @@ struct Index {
             .width('100%')
             .padding(10)
             .borderRadius(10)
-            .backgroundColor('#ffffff')
+            .backgroundColor('#D9FFFFFF')
+            .backgroundBlurStyle(BlurStyle.Thin)
             .onClick(() => { this.openLink(paper.url); })
           }
         }, (paper: PaperHit) => paper.url + paper.title)
@@ -790,6 +984,10 @@ struct Index {
       }
     })
     .barPosition(BarPosition.End)
+    .linearGradient({
+      angle: 160,
+      colors: [['#F7F2FF', 0.0], ['#E9F2FF', 0.55], ['#FDF6F0', 1.0]],
+    })
     .width('100%')
     .height('100%')
   }

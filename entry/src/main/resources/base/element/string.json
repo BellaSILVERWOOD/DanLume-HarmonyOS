@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "DanLume"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "语音输入需要麦克风权限"
     }
   ]
 }
