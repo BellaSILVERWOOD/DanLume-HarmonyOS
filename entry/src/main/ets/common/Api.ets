@@ -17,7 +17,7 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import zlib from '@ohos.zlib';
 import deviceInfo from '@ohos.deviceInfo';
 import common from '@ohos.app.ability.common';
-import { Db } from './Db';
+import { Db, ChatMessageRow, MemoryRow } from './Db';
 import { enabledToolSpecs, PHONE_TOOL_NAMES, TOOL_LABELS } from './AiTools';
 import { sendMail, fetchInbox } from './Mail';
 
@@ -97,6 +97,10 @@ const DEFAULT_MODEL: string = 'deepseek-chat';
 /** 人设与桌面版 `prompts.rs` 的 PERSONA 保持一致 */
 export const PERSONA: string = '你是梅子，DanLume 里的写作与学习助手。' +
   '回答用简体中文，简洁直接，先给结论再给要点；不确定的地方要说明不确定，不要编造。';
+
+/** 把对话整理成记忆库条目用的一次性提示词（memory_organize_* 工具） */
+const MEMORY_PROMPT: string = '把对话整理成可长期记住的要点，输出 JSON 数组，每项 {title, content, folder}，' +
+  'title 不超过 20 字且要概括，folder 形如 学业/高数 或 生活/偏好，最多 8 条，不要输出 JSON 以外的东西。';
 
 interface HttpResult {
   code: number;
@@ -505,6 +509,49 @@ export class Api {
       const id = await Db.memoAdd(text);
       return `已记录备忘 id=${id}`;
     }
+    if (name === 'memory_add') {
+      const title = textOf('title');
+      const content = textOf('content');
+      if (title.length === 0 || content.length === 0) {
+        return '缺 title 或 content';
+      }
+      const id = await Db.memoryAdd(title, content, textOf('folder'));
+      return `已记住 id=${id}：${title}`;
+    }
+    if (name === 'memory_search') {
+      const query = textOf('query');
+      const limit = numOf('limit', 5);
+      const rows: MemoryRow[] = await Db.memorySearch(
+        query, limit < 1 ? 5 : (limit > 20 ? 20 : limit));
+      if (rows.length === 0) {
+        return '没有匹配的记忆';
+      }
+      const out: string[] = [];
+      for (const row of rows) {
+        const text = row.content.length > 80 ? `${row.content.substring(0, 80)}…` : row.content;
+        out.push(`${row.id} | ${row.title} | ${row.folder} | ${text}`);
+      }
+      return out.join('\n');
+    }
+    if (name === 'memory_delete') {
+      const id = numOf('id', 0);
+      if (id <= 0) {
+        return '缺 id（先用 memory_search 查）';
+      }
+      await Db.memoryDelete(id);
+      return `已删除 id=${id}`;
+    }
+    if (name === 'memory_organize_session') {
+      // 手机端没有「当前会话」的全局变量，取最近更新的那个会话
+      const sessions = await Db.chatSessionList(1);
+      if (sessions.length === 0) {
+        return '没有可整理的对话';
+      }
+      return await Api.organizeMemories(sessions[0].id);
+    }
+    if (name === 'memory_organize_today') {
+      return await Api.organizeMemories(0);
+    }
     if (name === 'flashcards_create') {
       const raw = `${args['cards'] ?? '[]'}`;
       let arr: Object[] = [];
@@ -665,6 +712,107 @@ export class Api {
       return '手机端还没接 eLearning / 教务登录，先在电脑端用这个功能';
     }
     return `手机端没有工具 ${name}`;
+  }
+
+  /** 把对话整理成长期记忆；sessionId <= 0 表示今天所有会话。只发一次不带 tools 的请求，避免递归调工具 */
+  /** 每晚 18:00 的自动整理用（Index 的 aboutToAppear 里触发一次） */
+  static async organizeToday(): Promise<string> {
+    const rows = await Db.chatMessagesSince(`${Db.today()} 00:00:00`);
+    if (rows.length === 0) {
+      return '今天还没有对话';
+    }
+    return await Api.organizeMemories(0);
+  }
+
+  private static async organizeMemories(sessionId: number): Promise<string> {
+    try {
+      const profile = await Api.activeProfile();
+      if (profile === null || profile.key.trim().length === 0) {
+        return '整理失败：还没配置 AI 接口（我的 → AI 接口）';
+      }
+      let rows: ChatMessageRow[] = [];
+      if (sessionId > 0) {
+        rows = await Db.chatMessages(sessionId);
+      } else {
+        rows = await Db.chatMessagesSince(`${Db.today()} 00:00:00`);
+      }
+      const lines: string[] = [];
+      for (const row of rows) {
+        const who = row.role === 'user' ? '用户' : '梅子';
+        const text = row.text.trim();
+        if (text.length > 0) {
+          lines.push(`${who}：${text}`);
+        }
+      }
+      if (lines.length === 0) {
+        return '没有可整理的对话';
+      }
+      let transcript = lines.join('\n');
+      if (transcript.length > 6000) {
+        // 太长就留最近的部分，整段截到 6000 字
+        transcript = transcript.substring(transcript.length - 6000);
+      }
+
+      const base = profile.base.trim().length > 0 ? profile.base.trim() : DEFAULT_BASE_URL;
+      const model = profile.model.trim().length > 0 ? profile.model.trim() : DEFAULT_MODEL;
+      const payload: ChatPayload = {
+        model: model,
+        messages: [
+          { role: 'system', content: MEMORY_PROMPT },
+          { role: 'user', content: transcript },
+        ],
+        temperature: 0.2,
+      };
+      const result = await request(
+        http.RequestMethod.POST, `${base}/chat/completions`, JSON.stringify(payload), profile.key);
+      if (result.code !== 200) {
+        return `整理失败：${profile.name || model} 返回 ${result.code}`;
+      }
+      const data = JSON.parse(result.body) as Record<string, Object>;
+      const choices = data['choices'] as Object[] | undefined;
+      if (choices === undefined || choices.length === 0) {
+        return '整理失败：模型没有返回内容';
+      }
+      const message = (choices[0] as Record<string, Object>)['message'] as Record<string, Object>;
+      let content = `${message['content'] ?? ''}`.trim();
+      // 允许外面包 ```json 代码块，也容忍前后有说明文字
+      const fence = /```(?:json)?([\s\S]*?)```/.exec(content);
+      if (fence !== null) {
+        content = fence[1].trim();
+      }
+      const start = content.indexOf('[');
+      const end = content.lastIndexOf(']');
+      if (start >= 0 && end > start) {
+        content = content.substring(start, end + 1);
+      }
+      let arr: Object[] = [];
+      try {
+        arr = JSON.parse(content) as Object[];
+      } catch (e) {
+        return '整理失败：模型返回的不是 JSON 数组';
+      }
+      if (!Array.isArray(arr) || arr.length === 0) {
+        return '整理出 0 条记忆';
+      }
+      let n = 0;
+      for (const item of arr) {
+        if (n >= 8) {
+          break;
+        }
+        const o = item as Record<string, Object>;
+        const title = `${o['title'] ?? ''}`.trim();
+        const body = `${o['content'] ?? ''}`.trim();
+        const folder = `${o['folder'] ?? ''}`.trim();
+        if (title.length === 0 || body.length === 0) {
+          continue;
+        }
+        await Db.memoryAdd(title.length > 20 ? title.substring(0, 20) : title, body, folder);
+        n += 1;
+      }
+      return `整理出 ${n} 条记忆`;
+    } catch (e) {
+      return `整理失败：${e instanceof Error ? e.message : e}`;
+    }
   }
 
   /** 相对路径落到应用 filesDir 下 */

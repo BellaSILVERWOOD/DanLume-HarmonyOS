@@ -1,9 +1,9 @@
 /**
  * 极简 Markdown 解析（给聊天回答用）
  * 只做「模型真正会写、界面看得见」的那部分：
- *   标题 / 段落 / 无序列表 / 有序列表 / 引用 / 分隔线 / 围栏代码块，
+ *   标题 / 段落 / 无序列表 / 有序列表 / 引用 / 分隔线 / 围栏代码块 / 表格，
  *   行内 **粗体**、*斜体*、`行内代码`。
- * 表格不特殊处理（按段落显示），链接保留原文，避免在 ArkUI 里做点击态。
+ * 表格单元格按纯文本处理（不做行内 span），链接保留原文，避免在 ArkUI 里做点击态。
  */
 export enum MdKind {
   Para = 0,
@@ -13,6 +13,7 @@ export enum MdKind {
   Ordered = 4,
   Quote = 5,
   Rule = 6,
+  Table = 7,
 }
 
 export class MdSpan {
@@ -32,6 +33,8 @@ export class MdBlock {
   code: string = '';
   /** 列表前缀（• 或 1.） */
   marker: string = '';
+  /** 表格：第一行是表头，其余是数据行；单元格为纯文本，列数已按表头补齐 */
+  rows: string[][] = [];
   spans: MdSpan[] = [];
 }
 
@@ -177,6 +180,63 @@ function bulletBody(line: string): string {
   return t.substring(2).trim();
 }
 
+/** 按 | 切分表格行：去掉首尾分隔符产生的空项，单元格 trim */
+function splitCells(line: string): string[] {
+  const parts = line.trim().split('|');
+  let start = 0;
+  let end = parts.length;
+  if (end > start && parts[start].trim().length === 0) {
+    start += 1;
+  }
+  if (end > start && parts[end - 1].trim().length === 0) {
+    end -= 1;
+  }
+  const cells: string[] = [];
+  for (let k = start; k < end; k += 1) {
+    cells.push(parts[k].trim());
+  }
+  return cells;
+}
+
+/** 表格分隔行：形如 | --- | :--: |，每格只允许 -、:、空格且至少一个 - */
+function isTableSeparator(line: string): boolean {
+  if (line.indexOf('|') < 0) {
+    return false;
+  }
+  const cells = splitCells(line);
+  if (cells.length === 0) {
+    return false;
+  }
+  for (let k = 0; k < cells.length; k += 1) {
+    const cell = cells[k];
+    if (cell.length === 0) {
+      return false;
+    }
+    let dashes = 0;
+    for (let m = 0; m < cell.length; m += 1) {
+      const ch = cell.charAt(m);
+      if (ch === '-') {
+        dashes += 1;
+      } else if (ch !== ':' && ch !== ' ') {
+        return false;
+      }
+    }
+    if (dashes === 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** 把一行的单元格对齐到表头列数：缺的补空字符串，多的截掉 */
+function fitRow(cells: string[], cols: number): string[] {
+  const row: string[] = [];
+  for (let k = 0; k < cols; k += 1) {
+    row.push(k < cells.length ? cells[k] : '');
+  }
+  return row;
+}
+
 function pushTextBlock(out: MdBlock[], kind: MdKind, text: string): void {
   const b = new MdBlock();
   b.kind = kind;
@@ -225,6 +285,32 @@ export function parseMarkdown(src: string): MdBlock[] {
       flushPara();
       i += 1;
       continue;
+    }
+
+    // 表格：当前行含 |，且下一行是 | --- | :--: | 形式的分隔行
+    const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+    if (line.indexOf('|') >= 0 && isTableSeparator(nextLine)) {
+      const header = splitCells(line);
+      if (header.length > 0) {
+        flushPara();
+        const cols = header.length;
+        const b = new MdBlock();
+        b.kind = MdKind.Table;
+        b.rows.push(fitRow(header, cols));
+        // 跳过表头行与分隔行
+        i += 2;
+        while (i < lines.length) {
+          const rowLine = lines[i].trim();
+          // 空行或不再含 | 即结束表格，剩下的行交回外层正常解析
+          if (rowLine.length === 0 || rowLine.indexOf('|') < 0) {
+            break;
+          }
+          b.rows.push(fitRow(splitCells(rowLine), cols));
+          i += 1;
+        }
+        out.push(b);
+        continue;
+      }
     }
 
     if (isRule(line)) {

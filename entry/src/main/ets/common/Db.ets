@@ -30,6 +30,28 @@ export interface EventRow {
   reminder_id: number;
 }
 
+/** 对话会话（历史会话列表用） */
+export interface ChatSessionRow {
+  id: number;
+  title: string;
+  updated_at: string;
+}
+
+/** 一条聊天消息 */
+export interface ChatMessageRow {
+  role: string;
+  text: string;
+}
+
+/** 一条记忆（folder 形如 "学业/高数"，空 = 未归档） */
+export interface MemoryRow {
+  id: number;
+  title: string;
+  content: string;
+  folder: string;
+  updated_at: string;
+}
+
 /** 新建日程的入参（ArkTS 不允许把对象字面量直接当类型，必须显式声明） */
 export interface NewEventInput {
   title: string;
@@ -80,6 +102,27 @@ const SCHEMA: string[] = [
      title TEXT NOT NULL DEFAULT '',
      date TEXT NOT NULL DEFAULT '',
      created_at TEXT NOT NULL DEFAULT ''
+   )`,
+  `CREATE TABLE IF NOT EXISTS chat_sessions (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     title TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL DEFAULT '',
+     updated_at TEXT NOT NULL DEFAULT ''
+   )`,
+  `CREATE TABLE IF NOT EXISTS chat_messages (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     session_id INTEGER NOT NULL,
+     role TEXT NOT NULL DEFAULT '',
+     text TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL DEFAULT ''
+   )`,
+  `CREATE TABLE IF NOT EXISTS memories (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     title TEXT NOT NULL DEFAULT '',
+     content TEXT NOT NULL DEFAULT '',
+     folder TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL DEFAULT '',
+     updated_at TEXT NOT NULL DEFAULT ''
    )`,
 ];
 
@@ -439,6 +482,12 @@ export class Db {
     await Db.need().executeSql('UPDATE events SET reminder_id = ? WHERE id = ?', [reminderId, id]);
   }
 
+  /** 提醒提前多少分钟（0 = 不提醒） */
+  static async setRemindMinutes(id: number, minutes: number): Promise<void> {
+    await Db.need().executeSql('UPDATE events SET remind_minutes = ?, updated_at = ? WHERE id = ?',
+      [minutes, Db.isoNow(), id]);
+  }
+
   // ---------------------------------------------------------------- 备忘 / 闪卡 / 倒计时
   static async memoAdd(body: string): Promise<number> {
     const bucket: relationalStore.ValuesBucket = { body: body, created_at: Db.stamp() };
@@ -478,6 +527,134 @@ export class Db {
     if (rows.goToFirstRow()) {
       out.push(rows.getString(0));
       out.push(rows.getString(1));
+    }
+    rows.close();
+    return out;
+  }
+
+  // ---------------------------------------------------------------- 会话 / 记忆
+  static async chatSessionCreate(title: string): Promise<number> {
+    const bucket: relationalStore.ValuesBucket = {
+      title: title,
+      created_at: Db.stamp(),
+      updated_at: Db.isoNow(),
+    };
+    return await Db.need().insert('chat_sessions', bucket);
+  }
+
+  static async chatSessionRename(id: number, title: string): Promise<void> {
+    await Db.need().executeSql('UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?',
+      [title, Db.isoNow(), id]);
+  }
+
+  static async chatSessionDelete(id: number): Promise<void> {
+    await Db.need().executeSql('DELETE FROM chat_messages WHERE session_id = ?', [id]);
+    await Db.need().executeSql('DELETE FROM chat_sessions WHERE id = ?', [id]);
+  }
+
+  static async chatSessionList(limit: number): Promise<ChatSessionRow[]> {
+    const rows = await Db.need().querySql(
+      'SELECT id, title, updated_at FROM chat_sessions ORDER BY updated_at DESC LIMIT ?', [limit]);
+    const out: ChatSessionRow[] = [];
+    while (rows.goToNextRow()) {
+      out.push({
+        id: rows.getLong(0),
+        title: rows.getString(1),
+        updated_at: rows.getString(2),
+      });
+    }
+    rows.close();
+    return out;
+  }
+
+  static async chatMessageAdd(sessionId: number, role: string, text: string): Promise<void> {
+    const bucket: relationalStore.ValuesBucket = {
+      session_id: sessionId,
+      role: role,
+      text: text,
+      created_at: Db.stamp(),
+    };
+    await Db.need().insert('chat_messages', bucket);
+    await Db.need().executeSql('UPDATE chat_sessions SET updated_at = ? WHERE id = ?',
+      [Db.isoNow(), sessionId]);
+  }
+
+  static async chatMessages(sessionId: number): Promise<ChatMessageRow[]> {
+    const rows = await Db.need().querySql(
+      'SELECT role, text FROM chat_messages WHERE session_id = ? ORDER BY id', [sessionId]);
+    const out: ChatMessageRow[] = [];
+    while (rows.goToNextRow()) {
+      out.push({ role: rows.getString(0), text: rows.getString(1) });
+    }
+    rows.close();
+    return out;
+  }
+
+  /** 当天所有会话（整理记忆用） */
+  static async chatMessagesSince(isoStamp: string): Promise<ChatMessageRow[]> {
+    const rows = await Db.need().querySql(
+      'SELECT role, text FROM chat_messages WHERE created_at >= ? ORDER BY id', [isoStamp]);
+    const out: ChatMessageRow[] = [];
+    while (rows.goToNextRow()) {
+      out.push({ role: rows.getString(0), text: rows.getString(1) });
+    }
+    rows.close();
+    return out;
+  }
+
+  static async memoryAdd(title: string, content: string, folder: string): Promise<number> {
+    const bucket: relationalStore.ValuesBucket = {
+      title: title,
+      content: content,
+      folder: folder,
+      created_at: Db.stamp(),
+      updated_at: Db.isoNow(),
+    };
+    return await Db.need().insert('memories', bucket);
+  }
+
+  static async memoryUpdate(id: number, title: string, content: string, folder: string): Promise<void> {
+    await Db.need().executeSql(
+      'UPDATE memories SET title = ?, content = ?, folder = ?, updated_at = ? WHERE id = ?',
+      [title, content, folder, Db.isoNow(), id]);
+  }
+
+  static async memoryDelete(id: number): Promise<void> {
+    await Db.need().executeSql('DELETE FROM memories WHERE id = ?', [id]);
+  }
+
+  static async memoryList(): Promise<MemoryRow[]> {
+    const rows = await Db.need().querySql(
+      'SELECT id, title, content, folder, updated_at FROM memories ORDER BY folder, updated_at DESC');
+    const out: MemoryRow[] = [];
+    while (rows.goToNextRow()) {
+      out.push({
+        id: rows.getLong(0),
+        title: rows.getString(1),
+        content: rows.getString(2),
+        folder: rows.getString(3),
+        updated_at: rows.getString(4),
+      });
+    }
+    rows.close();
+    return out;
+  }
+
+  static async memorySearch(query: string, limit: number): Promise<MemoryRow[]> {
+    const like = `%${query}%`;
+    const rows = await Db.need().querySql(
+      'SELECT id, title, content, folder, updated_at FROM memories ' +
+      'WHERE title LIKE ? OR content LIKE ? OR folder LIKE ? ORDER BY updated_at DESC LIMIT ?',
+      [like, like, like, limit]);
+    const out: MemoryRow[] = [];
+    while (rows.goToNextRow()) {
+      out.push({
+        id: rows.getLong(0),
+        title: rows.getString(1),
+        content: rows.getString(2),
+        folder: rows.getString(3),
+        updated_at: rows.getString(4),
+      });
     }
     rows.close();
     return out;

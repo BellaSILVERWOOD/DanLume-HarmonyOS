@@ -1,4 +1,4 @@
-import { Db, EventRow } from '../common/Db';
+import { Db, EventRow, ChatSessionRow, MemoryRow } from '../common/Db';
 import { Api, PaperHit, AiProfile } from '../common/Api';
 import { importSystemCalendar, importDlpk, exportDayToSystem } from '../common/Migrate';
 import { PHONE_TOOL_NAMES, TOOL_LABELS, toolKey } from '../common/AiTools';
@@ -34,6 +34,14 @@ interface NoticeItem {
   title: string;
   body: string;
   created_at: string;
+}
+
+/** 记忆抽屉里的一行：0 = 文件夹标题，1 = 记忆条目 */
+interface MemLine {
+  kind: number;
+  title: string;
+  id: number;
+  folder: string;
 }
 
 /** 日历月视图的一格（day = 0 表示补位空格） */
@@ -96,6 +104,17 @@ struct Index {
   @State pomoLeft: number = 0;
   @State pomoOn: boolean = false;
   pomoTimer: number = -1;
+  // AI 历史会话 / 记忆
+  @State drawer: string = 'none';
+  @State sessions: ChatSessionRow[] = [];
+  @State memories: MemoryRow[] = [];
+  @State chatSessionId: number = 0;
+  @State renamingId: number = 0;
+  @State renameText: string = '';
+  @State memId: number = 0;
+  @State memTitle: string = '';
+  @State memContent: string = '';
+  @State memFolder: string = '';
   @State aiBase: string = '';
   @State aiModel: string = '';
   @State aiKey: string = '';
@@ -119,6 +138,8 @@ struct Index {
   @State editDate: string = '';
   @State editDesc: string = '';
   @State editAllDay: boolean = false;
+  @State editRemind: number = 10;
+  @State customRemind: string = '';
   @State sheetOpen: boolean = false;
   // 文献页（arXiv）
   @State paperQuery: string = '';
@@ -128,6 +149,27 @@ struct Index {
   // 语音识别引擎（第一次用时创建，之后复用）
   asrEngine: speechRecognizer.SpeechRecognitionEngine | null = null;
 
+  /** 每晚 18:00 之后第一次打开 App，自动把当天对话整理成记忆（一天只跑一次） */
+  async maybeOrganizeMemories(): Promise<void> {
+    const now = new Date();
+    if (now.getHours() < 18) {
+      return;
+    }
+    const today = Db.today();
+    const done = await Db.getSetting('memory_org_day', '');
+    if (done === today) {
+      return;
+    }
+    const toolsOn = (await Db.getSetting('ai_tools_enabled', '0')) === '1';
+    if (!toolsOn) {
+      return;
+    }
+    await Db.setSetting('memory_org_day', today);
+    const result = await Api.organizeToday();
+    this.message = `记忆整理：${result}`;
+    this.memories = await Db.memoryList();
+  }
+
   aboutToAppear(): void {
     // AI 工具（打开链接 / 读写沙箱文件）要用到应用上下文
     AppStorage.setOrCreate('abilityContext', getContext(this) as common.UIAbilityContext);
@@ -136,6 +178,7 @@ struct Index {
     this.reloadAi();
     this.reloadMail();
     this.reloadTools();
+    void this.maybeOrganizeMemories();
     if (this.month.length === 0) {
       this.month = this.today.slice(0, 7);
     }
@@ -243,6 +286,7 @@ struct Index {
     this.editStart = '09:00';
     this.editEnd = '10:00';
     this.editAllDay = false;
+    this.editRemind = 10;
     this.sheetOpen = true;
   }
 
@@ -254,6 +298,7 @@ struct Index {
     this.editStart = row.start_time.length > 0 ? row.start_time : '09:00';
     this.editEnd = row.end_time.length > 0 ? row.end_time : '10:00';
     this.editAllDay = row.start_time.length === 0;
+    this.editRemind = row.remind_minutes;
     this.sheetOpen = true;
   }
 
@@ -296,6 +341,102 @@ struct Index {
     });
   }
 
+  remindTextOf(minutes: number): string {
+    if (minutes <= 0) {
+      return '不提醒';
+    }
+    if (minutes % 1440 === 0) {
+      return `${minutes / 1440} 天前`;
+    }
+    if (minutes % 60 === 0) {
+      return `${minutes / 60} 小时前`;
+    }
+    return `${minutes} 分钟前`;
+  }
+
+  @Builder
+  remindMenu() {
+    Column({ space: 2 }) {
+      ForEach([0, 5, 10, 15, 30, 60, 1440], (minutes: number) => {
+        Row() {
+          Text(this.remindTextOf(minutes))
+            .fontSize(13)
+            .fontColor(minutes === this.editRemind ? '#c8546a' : '#1f2328')
+        }
+        .width(150)
+        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+        .borderRadius(8)
+        .onClick(() => { this.editRemind = minutes; })
+      }, (minutes: number) => `${minutes}`)
+      Divider().color('#EEEEF1')
+      Row({ space: 6 }) {
+        TextInput({ text: this.customRemind, placeholder: '自定义分钟' })
+          .width(86)
+          .height(32)
+          .fontSize(12)
+          .onChange((v: string) => { this.customRemind = v; })
+        Text('用这个')
+          .fontSize(12)
+          .fontColor('#c8546a')
+          .onClick(() => {
+            const n = parseInt(this.customRemind, 10);
+            if (!isNaN(n) && n >= 0) {
+              this.editRemind = n;
+            }
+          })
+      }
+      .width(150)
+      .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+    }
+    .width(150)
+    .padding(6)
+    .borderRadius(12)
+    .backgroundColor(Color.White)
+    .shadow({ radius: 16, color: '#1F2A2A40', offsetY: 6 })
+  }
+
+  /** 用 reminderAgent 建一条「到点弹通知」；返回 reminder id（0 = 失败） */
+  async publishReminder(title: string, date: string, start: string, minutes: number): Promise<number> {
+    const context = getContext(this) as common.UIAbilityContext;
+    try {
+      await notificationManager.requestEnableNotification(context);
+    } catch (e) {
+      // 拒绝通知权限时 publish 会失败，下面返回 0
+    }
+    const y = parseInt(date.slice(0, 4), 10);
+    const m = parseInt(date.slice(5, 7), 10);
+    const d = parseInt(date.slice(8, 10), 10);
+    const clock = start.length >= 5 ? start : '09:00';
+    const hh = parseInt(clock.slice(0, 2), 10);
+    const mm = parseInt(clock.slice(3, 5), 10);
+    const when = new Date(isNaN(y) ? 2026 : y, isNaN(m) ? 0 : m - 1, isNaN(d) ? 1 : d,
+      isNaN(hh) ? 9 : hh, isNaN(mm) ? 0 : mm, 0);
+    when.setMinutes(when.getMinutes() - Math.max(0, minutes));
+    const request: reminderAgentManager.ReminderRequestCalendar = {
+      reminderType: reminderAgentManager.ReminderType.REMINDER_TYPE_CALENDAR,
+      dateTime: {
+        year: when.getFullYear(),
+        month: when.getMonth() + 1,
+        day: when.getDate(),
+        hour: when.getHours(),
+        minute: when.getMinutes(),
+        second: 0,
+      },
+      title: '日程提醒',
+      content: title,
+      expiredContent: title,
+      snoozeTimes: 0,
+      ringDuration: 5,
+      wantAgent: { pkgName: 'com.danlume.app.harmony', abilityName: 'EntryAbility' },
+    };
+    try {
+      return await reminderAgentManager.publishReminder(request);
+    } catch (err) {
+      this.message = `设提醒失败：${err}`;
+      return 0;
+    }
+  }
+
   async saveSheet(): Promise<void> {
     const title = this.editTitle.trim();
     if (title.length === 0) {
@@ -305,13 +446,16 @@ struct Index {
     const date = this.editDate.length > 0 ? this.editDate : (this.selDate.length > 0 ? this.selDate : Db.today());
     const start = this.editAllDay ? '' : this.editStart;
     const end = this.editAllDay ? '' : this.editEnd;
-    if (this.editEventId > 0) {
-      const old = await Db.eventById(this.editEventId);
+    let eventId = this.editEventId;
+    let oldReminder = 0;
+    if (eventId > 0) {
+      const old = await Db.eventById(eventId);
       const done = old !== null ? old.done : false;
-      await Db.updateEventFields(this.editEventId, title, date, start, end, done, this.editDesc.trim());
+      oldReminder = old !== null ? old.reminder_id : 0;
+      await Db.updateEventFields(eventId, title, date, start, end, done, this.editDesc.trim());
       this.message = '已保存';
     } else {
-      await Db.addEvent({
+      eventId = await Db.addEvent({
         title: title,
         date: date,
         start_time: start,
@@ -319,6 +463,22 @@ struct Index {
         description: this.editDesc.trim(),
       });
       this.message = `已加到 ${date}`;
+    }
+    // 提醒：先撤旧的，再按这次选的提前量建新的
+    if (oldReminder > 0) {
+      try {
+        await reminderAgentManager.cancelReminder(oldReminder);
+      } catch (e) {
+        // 可能已被系统清理
+      }
+      await Db.setReminderId(eventId, 0);
+    }
+    await Db.setRemindMinutes(eventId, this.editRemind);
+    if (this.editRemind > 0 && !this.editAllDay) {
+      const rid = await this.publishReminder(title, date, start, this.editRemind);
+      if (rid > 0) {
+        await Db.setReminderId(eventId, rid);
+      }
     }
     this.sheetOpen = false;
     this.editEventId = 0;
@@ -331,11 +491,41 @@ struct Index {
     await this.reloadToday();
   }
 
-  async deleteEditEvent(): Promise<void> {
+  /** 删除前先确认 */
+  deleteEditEvent(): void {
     if (this.editEventId === 0) {
       return;
     }
-    await Db.deleteEvent(this.editEventId);
+    const id = this.editEventId;
+    AlertDialog.show({
+      title: '删除日程',
+      message: '确认删除这条日程吗？',
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          // 什么都不做
+        },
+      },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#c8546a',
+        action: () => {
+          void this.doDeleteEvent(id);
+        },
+      },
+    });
+  }
+
+  async doDeleteEvent(id: number): Promise<void> {
+    const row = await Db.eventById(id);
+    if (row !== null && row.reminder_id > 0) {
+      try {
+        await reminderAgentManager.cancelReminder(row.reminder_id);
+      } catch (e) {
+        // 忽略
+      }
+    }
+    await Db.deleteEvent(id);
     this.editEventId = 0;
     this.sheetOpen = false;
     this.message = '已删除';
@@ -727,6 +917,11 @@ struct Index {
     this.message = this.aiKey.trim().length > 0
       ? `已保存「${name}」（共 ${this.aiProfiles.length} 组）`
       : `已保存「${name}」，但还没填 API Key`;
+    try {
+      promptAction.showToast({ message: this.message, duration: 2000 });
+    } catch (e) {
+      // 忽略
+    }
   }
 
   async deleteAiProfile(index: number): Promise<void> {
@@ -835,10 +1030,32 @@ struct Index {
     return `${this.pad2(Math.floor(this.pomoLeft / 60))}:${this.pad2(this.pomoLeft % 60)}`;
   }
 
-  async removeEvent(id: number): Promise<void> {
+  removeEvent(id: number): void {
+    AlertDialog.show({
+      title: '删除日程',
+      message: '确认删除这条日程吗？',
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          // 什么都不做
+        },
+      },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#c8546a',
+        action: () => {
+          void this.doRemoveEvent(id);
+        },
+      },
+    });
+  }
+
+  async doRemoveEvent(id: number): Promise<void> {
     await Db.deleteEvent(id);
     this.message = '已删除';
     await this.reloadToday();
+    await this.reloadMonth();
+    await this.reloadDay();
   }
 
   async saveEdit(id: number): Promise<void> {
@@ -944,9 +1161,15 @@ struct Index {
     }
     this.chat.push({ role: 'user', text: text });
     this.chatDraft = '';
+    if (this.chatSessionId === 0) {
+      this.chatSessionId = await Db.chatSessionCreate(
+        text.length > 20 ? `${text.substring(0, 20)}…` : text);
+    }
+    await Db.chatMessageAdd(this.chatSessionId, 'user', text);
     try {
       const answer = await Api.chat(text, history);
       this.chat.push({ role: 'assistant', text: answer });
+      await Db.chatMessageAdd(this.chatSessionId, 'assistant', answer);
     } catch (err) {
       this.chat.push({ role: 'assistant', text: `出错了：${err}` });
     } finally {
@@ -1043,7 +1266,163 @@ struct Index {
 
   clearChat(): void {
     this.chat = [];
-    this.message = '对话已清空';
+    this.chatSessionId = 0;
+    this.drawer = 'none';
+    this.message = '新对话';
+  }
+
+  // ------------------------------------------------------------ 历史会话
+  async openHistory(): Promise<void> {
+    this.sessions = await Db.chatSessionList(50);
+    this.drawer = 'history';
+  }
+
+  closeDrawer(): void {
+    this.drawer = 'none';
+    this.renamingId = 0;
+  }
+
+  async loadSession(id: number): Promise<void> {
+    const rows = await Db.chatMessages(id);
+    const lines: ChatLine[] = [];
+    for (const row of rows) {
+      const line: ChatLine = {
+        role: row.role === 'user' ? 'user' : 'assistant',
+        text: row.text,
+      };
+      lines.push(line);
+    }
+    this.chat = lines;
+    this.chatSessionId = id;
+    this.drawer = 'none';
+  }
+
+  startRename(session: ChatSessionRow): void {
+    this.renamingId = session.id;
+    this.renameText = session.title;
+  }
+
+  async saveRename(): Promise<void> {
+    if (this.renamingId === 0) {
+      return;
+    }
+    const title = this.renameText.trim();
+    if (title.length === 0) {
+      return;
+    }
+    await Db.chatSessionRename(this.renamingId, title);
+    this.renamingId = 0;
+    this.sessions = await Db.chatSessionList(50);
+  }
+
+  deleteSession(id: number): void {
+    AlertDialog.show({
+      title: '删除会话',
+      message: '确认删除这个历史会话吗？',
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          // 什么都不做
+        },
+      },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#c8546a',
+        action: () => {
+          void this.doDeleteSession(id);
+        },
+      },
+    });
+  }
+
+  async doDeleteSession(id: number): Promise<void> {
+    await Db.chatSessionDelete(id);
+    if (this.chatSessionId === id) {
+      this.chat = [];
+      this.chatSessionId = 0;
+    }
+    this.renamingId = 0;
+    this.sessions = await Db.chatSessionList(50);
+    this.message = '会话已删除';
+  }
+
+  // ------------------------------------------------------------ 记忆
+  async openMemory(): Promise<void> {
+    this.memories = await Db.memoryList();
+    this.drawer = 'memory';
+  }
+
+  folderLabel(folder: string): string {
+    return folder.length > 0 ? folder : '未归档';
+  }
+
+  /** 记忆按文件夹分层：遇到新文件夹插一行标题 */
+  memoryLines(): MemLine[] {
+    const out: MemLine[] = [];
+    let last = '';
+    for (const item of this.memories) {
+      const folder = this.folderLabel(item.folder);
+      if (folder !== last) {
+        out.push({ kind: 0, title: folder, id: 0, folder: folder });
+        last = folder;
+      }
+      out.push({ kind: 1, title: item.title, id: item.id, folder: item.folder });
+    }
+    return out;
+  }
+
+  findMemory(id: number): MemoryRow | null {
+    for (const item of this.memories) {
+      if (item.id === id) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  openMemoryEdit(item: MemoryRow): void {
+    this.memId = item.id;
+    this.memTitle = item.title;
+    this.memContent = item.content;
+    this.memFolder = item.folder;
+    this.drawer = 'memedit';
+  }
+
+  async saveMemory(): Promise<void> {
+    if (this.memId === 0) {
+      return;
+    }
+    await Db.memoryUpdate(this.memId, this.memTitle.trim(), this.memContent, this.memFolder.trim());
+    this.memories = await Db.memoryList();
+    this.drawer = 'memory';
+    this.message = '记忆已保存';
+  }
+
+  deleteMemory(id: number): void {
+    AlertDialog.show({
+      title: '删除记忆',
+      message: '确认删除这条记忆吗？',
+      primaryButton: {
+        value: '取消',
+        action: () => {
+          // 什么都不做
+        },
+      },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#c8546a',
+        action: () => {
+          void this.doDeleteMemory(id);
+        },
+      },
+    });
+  }
+
+  async doDeleteMemory(id: number): Promise<void> {
+    await Db.memoryDelete(id);
+    this.memories = await Db.memoryList();
+    this.drawer = 'memory';
+    this.message = '记忆已删除';
   }
 
   copyText(text: string): void {
@@ -1098,6 +1477,9 @@ struct Index {
     try {
       const answer = await Api.chat(lastUser, history);
       this.chat.push({ role: 'assistant', text: answer });
+      if (this.chatSessionId > 0) {
+        await Db.chatMessageAdd(this.chatSessionId, 'assistant', answer);
+      }
     } catch (err) {
       this.chat.push({ role: 'assistant', text: `出错了：${err}` });
     } finally {
@@ -1434,6 +1816,8 @@ struct Index {
           .alignItems(HorizontalAlign.Start)
           .padding({ left: 10, top: 2, bottom: 2 })
           .border({ width: { left: 3 }, color: '#E3E4E8' })
+        } else if (b.kind === MdKind.Table) {
+          this.mdTable(b)
         } else if (b.kind === MdKind.Heading) {
           Column() {
             this.richSpans(b.spans, b.level <= 2 ? 19 : 16, '#2b2f36', true)
@@ -1508,6 +1892,224 @@ struct Index {
     .shadow({ radius: 18, color: '#1F2A2A40', offsetY: 6 })
   }
 
+  /** Markdown 表格：等宽单元格 + 横向滚动，表头浅灰底 */
+  @Builder
+  mdTable(b: MdBlock) {
+    Scroll() {
+      Column({ space: 0 }) {
+        ForEach(b.rows, (row: string[], ri: number) => {
+          Row({ space: 0 }) {
+            ForEach(row, (cell: string, ci: number) => {
+              Text(cell)
+                .fontSize(12)
+                .fontColor(ri === 0 ? '#1f2328' : '#3a3a40')
+                .fontWeight(ri === 0 ? FontWeight.Bold : FontWeight.Normal)
+                .width(110)
+                .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+                .textAlign(TextAlign.Start)
+            }, (cell: string, ci: number) => `${ri}-${ci}`)
+          }
+          .width('100%')
+          .backgroundColor(ri === 0 ? '#F0F0F4' : (ri % 2 === 0 ? '#FAFAFC' : Color.White))
+          .border({ width: { bottom: 1 }, color: '#ECECF0' })
+        }, (row: string[], ri: number) => `${ri}-${row.length}`)
+      }
+      .borderRadius(10)
+      .clip(true)
+      .border({ width: 1, color: '#E4E4EA' })
+    }
+    .scrollable(ScrollDirection.Horizontal)
+    .scrollBar(BarState.Off)
+    .width('100%')
+    .align(Alignment.TopStart)
+  }
+
+  // ------------------------------------------------------------ 侧边抽屉
+  @Builder
+  drawerPanel() {
+    Column() {
+      if (this.drawer === 'history') {
+        this.historyDrawer()
+      } else if (this.drawer === 'memory') {
+        this.memoryDrawer()
+      } else if (this.drawer === 'memedit') {
+        this.memoryEditor()
+      }
+    }
+    .width('80%')
+    .height('100%')
+    .backgroundColor('#F7F7FA')
+    .shadow({ radius: 16, color: '#332A2A40', offsetX: 4 })
+  }
+
+  @Builder
+  historyDrawer() {
+    Column({ space: 8 }) {
+      Row({ space: 8 }) {
+        Text('历史会话').fontSize(16).fontWeight(600).fontColor('#1f2328').layoutWeight(1)
+        Text('＋')
+          .fontSize(20)
+          .fontColor('#c8546a')
+          .padding(4)
+          .onClick(() => { this.clearChat(); })
+      }
+      .width('100%')
+
+      if (this.sessions.length === 0) {
+        Text('还没有历史会话').fontSize(12).fontColor('#9a9aa2').width('100%')
+      }
+      Scroll() {
+        Column({ space: 6 }) {
+          ForEach(this.sessions, (session: ChatSessionRow) => {
+            Column() {
+              if (this.renamingId === session.id) {
+                Row({ space: 6 }) {
+                  TextInput({ text: this.renameText })
+                    .layoutWeight(1)
+                    .height(34)
+                    .fontSize(13)
+                    .onChange((v: string) => { this.renameText = v; })
+                  Text('保存')
+                    .fontSize(12)
+                    .fontColor('#c8546a')
+                    .onClick(() => { void this.saveRename(); })
+                  Text('删除')
+                    .fontSize(12)
+                    .fontColor('#c8546a')
+                    .onClick(() => { this.deleteSession(session.id); })
+                }
+                .width('100%')
+              } else {
+                Row() {
+                  Text(session.title.length > 0 ? session.title : '未命名会话')
+                    .fontSize(13)
+                    .fontColor(this.chatSessionId === session.id ? '#c8546a' : '#1f2328')
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .layoutWeight(1)
+                }
+                .width('100%')
+                .height(36)
+                .onClick(() => { void this.loadSession(session.id); })
+                .gesture(LongPressGesture().onAction(() => { this.startRename(session); }))
+              }
+            }
+            .width('100%')
+            .padding(8)
+            .borderRadius(8)
+            .backgroundColor(Color.White)
+          }, (session: ChatSessionRow) => `${session.id}-${session.title}`)
+        }
+        .width('100%')
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .scrollBar(BarState.Off)
+      .align(Alignment.TopStart)
+
+      Text('长按会话可以重命名 / 删除').fontSize(10).fontColor('#b9bcc4').width('100%')
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+  }
+
+  @Builder
+  memoryDrawer() {
+    Column({ space: 8 }) {
+      Row({ space: 8 }) {
+        Text('记忆').fontSize(16).fontWeight(600).fontColor('#1f2328').layoutWeight(1)
+        Text(`${this.memories.length} 条`).fontSize(11).fontColor('#9a9aa2')
+      }
+      .width('100%')
+
+      if (this.memories.length === 0) {
+        Text('还没有记忆；让梅子「记住…」就会出现在这里').fontSize(12).fontColor('#9a9aa2').width('100%')
+      }
+      Scroll() {
+        Column({ space: 4 }) {
+          ForEach(this.memoryLines(), (line: MemLine) => {
+            if (line.kind === 0) {
+              Text(`📁 ${line.title}`)
+                .fontSize(12)
+                .fontColor('#8a8f98')
+                .width('100%')
+                .padding({ top: 6, bottom: 2 })
+            } else {
+              Text(line.title)
+                .fontSize(13)
+                .fontColor('#1f2328')
+                .width('100%')
+                .padding(10)
+                .borderRadius(8)
+                .backgroundColor(Color.White)
+                .onClick(() => {
+                  const item = this.findMemory(line.id);
+                  if (item !== null) {
+                    this.openMemoryEdit(item);
+                  }
+                })
+                .gesture(LongPressGesture().onAction(() => { this.deleteMemory(line.id); }))
+            }
+          }, (line: MemLine) => `${line.kind}-${line.id}-${line.title}`)
+        }
+        .width('100%')
+      }
+      .layoutWeight(1)
+      .width('100%')
+      .scrollBar(BarState.Off)
+      .align(Alignment.TopStart)
+
+      Text('点开可编辑 · 长按删除').fontSize(10).fontColor('#b9bcc4').width('100%')
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+  }
+
+  @Builder
+  memoryEditor() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        Text('‹')
+          .fontSize(22)
+          .fontColor('#1f2328')
+          .width(32)
+          .textAlign(TextAlign.Center)
+          .onClick(() => { this.drawer = 'memory'; })
+        Text('编辑记忆').fontSize(16).fontWeight(600).fontColor('#1f2328').layoutWeight(1)
+        Text('保存')
+          .fontSize(13)
+          .fontColor('#c8546a')
+          .onClick(() => { void this.saveMemory(); })
+      }
+      .width('100%')
+
+      TextInput({ text: this.memTitle, placeholder: '标题（要概括）' })
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((v: string) => { this.memTitle = v; })
+      TextInput({ text: this.memFolder, placeholder: '归档文件夹，如 学业/高数（可空）' })
+        .height(40)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((v: string) => { this.memFolder = v; })
+      TextArea({ text: this.memContent, placeholder: '记忆内容' })
+        .layoutWeight(1)
+        .width('100%')
+        .borderRadius(10)
+        .onChange((v: string) => { this.memContent = v; })
+      Text('删除这条记忆')
+        .fontSize(12)
+        .fontColor('#c8546a')
+        .onClick(() => { this.deleteMemory(this.memId); })
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+  }
+
   @Builder
   chatTab() {
     // 列表在底层、输入框浮在上面：文字从半透明输入框底下滚过去，才不会出现「纯色块盖住文字」
@@ -1520,7 +2122,13 @@ struct Index {
             .width(38)
             .height(38)
             .textAlign(TextAlign.Center)
-            .onClick(() => { this.message = '历史聊天：下一步接 chat_sessions'; })
+            .onClick(() => { void this.openHistory(); })
+          Text('🧠')
+            .fontSize(20)
+            .width(38)
+            .height(38)
+            .textAlign(TextAlign.Center)
+            .onClick(() => { void this.openMemory(); })
           Row({ space: 4 }) {
             Text('梅子').fontSize(16).fontWeight(600).fontColor('#1f2328')
             Text('›').fontSize(18).fontColor('#9a9aa2')
@@ -1674,7 +2282,9 @@ struct Index {
 
   @Builder
   meTab() {
-    Column({ space: 12 }) {
+    // 设置页内容很长：必须包一层 Scroll，否则下面的「保存这组接口 / 邮件 / 小工具」点不到
+    Scroll() {
+      Column({ space: 12 }) {
       if (this.message.length > 0) {
         Text(this.message).fontSize(12).fontColor('#c8546a').width('100%')
       }
@@ -2104,10 +2714,15 @@ struct Index {
       if (this.message.length > 0) {
         Text(this.message).fontSize(12).fontColor('#c8546a').width('100%')
       }
+      }
+      .padding(16)
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
     }
-    .padding(16)
     .width('100%')
     .height('100%')
+    .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
   }
 
   @Builder
@@ -2270,11 +2885,13 @@ struct Index {
           Column() {
             Row({ space: 8 }) {
               Text('提醒').fontSize(15).fontColor('#1f2328').layoutWeight(1)
-              Text('10 分钟前').fontSize(13).fontColor('#8a8f98')
+              Text(this.remindTextOf(this.editRemind)).fontSize(13).fontColor('#8a8f98')
+              Text('›').fontSize(16).fontColor('#C7C9CE')
             }
             .width('100%')
             .height(52)
             .padding({ left: 12, right: 12 })
+            .bindMenu(this.remindMenu)
             Divider().color('#EFEFF3').margin({ left: 12, right: 12 })
             Row({ space: 8 }) {
               Text('重复').fontSize(15).fontColor('#1f2328').layoutWeight(1)
@@ -2560,8 +3177,9 @@ struct Index {
   }
 
   build() {
-    Tabs({ index: this.currentTab }) {
-      TabContent() { this.todayTab() }.tabBar('今日')
+    Stack({ alignContent: Alignment.TopStart }) {
+      Tabs({ index: this.currentTab }) {
+      TabContent() { this.todayTab() }.tabBar('首页')
       TabContent() { this.calendarTab() }.tabBar('日历')
       TabContent() { this.literatureTab() }.tabBar('文献')
       TabContent() { this.chatTab() }.tabBar('梅子')
@@ -2580,8 +3198,26 @@ struct Index {
     .backgroundColor(Color.White)
     .bindSheet($$this.sheetOpen, this.eventSheet, {
       height: SheetSize.LARGE,
-      dragBar: true,
+      dragBar: false,
+      showClose: false,
     })
+    .width('100%')
+    .height('100%')
+
+      // 左侧抽屉（历史会话 / 记忆），右边是半透明遮罩，点一下关掉
+      if (this.drawer !== 'none') {
+        Row() {
+          this.drawerPanel()
+          Column()
+            .layoutWeight(1)
+            .height('100%')
+            .backgroundColor('#66000000')
+            .onClick(() => { this.closeDrawer(); })
+        }
+        .width('100%')
+        .height('100%')
+      }
+    }
     .width('100%')
     .height('100%')
   }

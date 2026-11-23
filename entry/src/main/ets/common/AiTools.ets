@@ -2,8 +2,8 @@
  * 手机端 AI 工具（function calling）的规格表。
  * 跟电脑端 `aiTools.ts` 一个思路：总开关 `ai_tools_enabled` + 每个工具 `ai_tool_<name>`。
  *
- * 这批工具是用户逐个确认过要迁的（2026-11-24）：日程、计时、备忘、闪卡、文献、网络检索、
- * 文件（沙箱内）、系统信息、设置。eLearning / 邮件 / 番茄钟后台计时目前只保留入口，
+ * 这批工具是用户逐个确认过要迁的（2026-11-24）：日程、计时、备忘、闪卡、记忆、文献、
+ * 网络检索、文件（沙箱内）、系统信息、设置。eLearning / 邮件 / 番茄钟后台计时目前只保留入口，
  * 执行时返回「还没接」的说明，等后续实现。
  */
 import { Db } from './Db';
@@ -92,6 +92,22 @@ export function toolSpecs(): Object[] {
     obj({ 'cards': str('JSON 数组：[{\"question\":\"…\",\"answer\":\"…\",\"tag\":\"…\"}]') }, ['cards'])));
   list.push(spec('usage_stats', '本地使用统计：日程数、备忘数、闪卡数、AI 调用次数。', obj({}, [])));
 
+  // 记忆（AI 的长期要点）
+  list.push(spec('memory_add', '把值得长期记住的事写进记忆库。title 要概括，方便以后检索。',
+    obj({
+      'title': str('概括性标题，不超过 20 字'),
+      'content': str('要记住的内容'),
+      'folder': str('文件夹，形如 学业/高数，可省略'),
+    }, ['title', 'content'])));
+  list.push(spec('memory_search', '在记忆库里按关键词检索（匹配标题 / 内容 / 文件夹）。',
+    obj({ 'query': str('关键词'), 'limit': num('条数，默认 5') }, ['query'])));
+  list.push(spec('memory_delete', '删除一条记忆，id 来自 memory_search。',
+    obj({ 'id': num('记忆 id') }, ['id'])));
+  list.push(spec('memory_organize_session', '把当前会话的对话整理成长期记忆要点（不需要参数）。',
+    obj({}, [])));
+  list.push(spec('memory_organize_today', '把今天所有会话的对话整理成长期记忆要点（不需要参数）。',
+    obj({}, [])));
+
   // 文献
   list.push(spec('arxiv_search', '在 arXiv 上检索论文。',
     obj({ 'query': str('检索词，英文更好'), 'limit': num('1-10，默认 5') }, ['query'])));
@@ -164,6 +180,7 @@ export const PHONE_TOOL_NAMES: string[] = [
   'schedule_list', 'schedule_add', 'schedule_update', 'schedule_delete',
   'time_now', 'countdown_add', 'countdown_list', 'pomodoro_start',
   'memo_search', 'memo_append', 'flashcards_create', 'usage_stats',
+  'memory_add', 'memory_search', 'memory_delete', 'memory_organize_session', 'memory_organize_today',
   'arxiv_search', 'crossref_search', 'semantic_scholar_search', 'doi_lookup',
   'literature_search', 'pdf_download', 'citation_format', 'endnote_export',
   'web_search', 'web_fetch', 'video_search',
@@ -176,6 +193,7 @@ export const TOOL_LABELS: string[] = [
   '查看日程', '新建日程', '修改日程', '删除日程',
   '当前时间', '加倒计时', '列倒计时', '番茄钟（仅记录）',
   '备忘检索', '追加备忘', '生成闪卡', '使用统计',
+  '记住要点', '检索记忆', '删除记忆', '整理本会话', '整理今日对话',
   'arXiv 检索', 'Crossref 检索', 'S2 检索', 'DOI 查询',
   '综合文献检索', '下载 PDF', '引用格式', '导出 EndNote',
   '网页搜索', '抓取网页', '视频搜索',

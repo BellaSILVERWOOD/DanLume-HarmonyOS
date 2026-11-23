@@ -47,6 +47,7 @@ export async function importSystemCalendar(context: common.UIAbilityContext): Pr
   let read = 0;
   let added = 0;
   let failed = 0;
+  const seen: string[] = [];
   for (let ci = 0; ci < calendars.length; ci += 1) {
     const cal = calendars[ci];
     let events: calendarManager.Event[] = [];
@@ -68,6 +69,11 @@ export async function importSystemCalendar(context: common.UIAbilityContext): Pr
       const date = dateOf(ev.startTime);
       const start = allDay ? '' : timeOf(ev.startTime);
       const end = allDay ? '' : timeOf(ev.endTime);
+      const key = `${title}|${date}|${start}`;
+      if (seen.includes(key)) {
+        continue;
+      }
+      seen.push(key);
       if (await Db.hasEvent(title, date, start)) {
         continue;
       }
@@ -111,22 +117,24 @@ export async function exportDayToSystem(context: common.UIAbilityContext, date: 
     return '系统里还没有任何日历账户';
   }
   const cal = calendars[0];
-  // 已经写过的（同一天同标题）跳过，避免重复
+  // 已经写过的（同一天同标题）跳过：所有日历账户都查一遍，标题去空格再比
   const existing: string[] = [];
-  try {
-    const dayStart = new Date(`${date}T00:00:00`).getTime();
-    const dayEnd = dayStart + 24 * 3600 * 1000;
-    const events = await cal.getEvents(calendarManager.EventFilter.filterByTime(dayStart, dayEnd));
-    for (const ev of events) {
-      existing.push(`${ev.title ?? ''}`);
+  const dayStart = new Date(`${date}T00:00:00`).getTime();
+  const dayEnd = dayStart + 24 * 3600 * 1000;
+  for (const each of calendars) {
+    try {
+      const events = await each.getEvents(calendarManager.EventFilter.filterByTime(dayStart, dayEnd));
+      for (const ev of events) {
+        existing.push(`${ev.title ?? ''}`.trim());
+      }
+    } catch (e) {
+      // 读不到就当没有
     }
-  } catch (e) {
-    // 读不到就当没有
   }
   let added = 0;
   let skipped = 0;
   for (const row of rows) {
-    if (existing.includes(row.title)) {
+    if (existing.includes(row.title.trim())) {
       skipped += 1;
       continue;
     }
@@ -152,6 +160,7 @@ export async function exportDayToSystem(context: common.UIAbilityContext, date: 
     };
     try {
       await cal.addEvent(event);
+      existing.push(row.title.trim());
       added += 1;
     } catch (e) {
       console.error(`[cal] addEvent failed: ${e}`);
