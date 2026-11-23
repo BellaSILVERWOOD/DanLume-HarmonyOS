@@ -622,19 +622,37 @@ struct Index {
   chatTab() {
     Column({ space: 10 }) {
       Row({ space: 8 }) {
-        Text('☰').fontSize(20).fontColor('#3a3a40').width(36).textAlign(TextAlign.Center)
+        Stack() {
+          Text('☰').fontSize(18).fontColor('#2b2f36')
+        }
+        .width(40)
+        .height(40)
+        .borderRadius(20)
+        .backgroundColor('#40FFFFFF')
+        .backgroundBlurStyle(BlurStyle.Thick)
+        .border({ width: 1, color: '#80FFFFFF' })
+        .onClick(() => { this.message = '历史聊天：下一步接 chat_sessions'; })
         Text('梅子').fontSize(16).fontWeight(600).layoutWeight(1).textAlign(TextAlign.Center)
-        Text('✎')
-          .fontSize(18)
-          .fontColor('#3a3a40')
-          .width(36)
-          .textAlign(TextAlign.Center)
-          .onClick(() => { this.clearChat(); })
+        Stack() {
+          Text('✎').fontSize(18).fontColor('#2b2f36')
+        }
+        .width(40)
+        .height(40)
+        .borderRadius(20)
+        .backgroundColor('#40FFFFFF')
+        .backgroundBlurStyle(BlurStyle.Thick)
+        .border({ width: 1, color: '#80FFFFFF' })
+        .onClick(() => { this.clearChat(); })
       }
       .width('100%')
 
       if (this.chat.length === 0) {
         Column({ space: 8 }) {
+          Text('LUME')
+            .fontSize(36)
+            .fontWeight(700)
+            .letterSpacing(6)
+            .fontColor('#2b2f36')
           Text('有什么可以帮你？').fontSize(22).fontWeight(600).fontColor('#2b2f36')
           Text('问日程、作业、文献，或直接说「帮我写…」').fontSize(13).fontColor('#8a8f98')
         }
@@ -687,8 +705,8 @@ struct Index {
         .width(36)
         .height(36)
         .borderRadius(18)
-        .backgroundColor('#59FFFFFF')
-        .backgroundBlurStyle(BlurStyle.Regular)
+        .backgroundColor('#40FFFFFF')
+        .backgroundBlurStyle(BlurStyle.Thick)
         .onClick(() => { this.message = '附件功能待接入'; })
         TextInput({ text: this.chatDraft, placeholder: 'Ask 梅子…' })
           .layoutWeight(1)
@@ -704,8 +722,8 @@ struct Index {
         .width(36)
         .height(36)
         .borderRadius(18)
-        .backgroundColor(this.listening ? '#59FFD9D9' : '#59FFFFFF')
-        .backgroundBlurStyle(BlurStyle.Regular)
+        .backgroundColor(this.listening ? '#59FFD9D9' : '#40FFFFFF')
+        .backgroundBlurStyle(BlurStyle.Thick)
         .onClick(() => { void this.toggleVoice(); })
         Stack() {
           Text(this.asking ? '…' : '↑').fontSize(18).fontColor(Color.White)
@@ -713,7 +731,7 @@ struct Index {
         .width(36)
         .height(36)
         .borderRadius(18)
-        .backgroundColor(this.chatDraft.trim().length > 0 ? '#0A84FF' : '#C7C7CC')
+        .backgroundColor(this.chatDraft.trim().length > 0 ? '#c8546a' : '#C7C7CC')
         .onClick(() => {
           if (!this.asking) {
             void this.askMeizi();
@@ -723,9 +741,9 @@ struct Index {
       .width('100%')
       .padding({ left: 8, right: 8, top: 6, bottom: 6 })
       .borderRadius(26)
-      .backgroundColor('#59FFFFFF')
-      .backgroundBlurStyle(BlurStyle.Regular)
-      .border({ width: 1, color: '#66FFFFFF' })
+      .backgroundColor('#40FFFFFF')
+      .backgroundBlurStyle(BlurStyle.Thick)
+      .border({ width: 1, color: '#80FFFFFF' })
       .shadow({ radius: 18, color: '#1A2A2A40', offsetY: 6 })
     }
     .padding(16)
@@ -986,7 +1004,7 @@ struct Index {
     .barPosition(BarPosition.End)
     .linearGradient({
       angle: 160,
-      colors: [['#F7F2FF', 0.0], ['#E9F2FF', 0.55], ['#FDF6F0', 1.0]],
+      colors: [['#EADFFF', 0.0], ['#D9EAFF', 0.55], ['#FFE6D9', 1.0]],
     })
     .width('100%')
     .height('100%')
