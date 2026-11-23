@@ -129,6 +129,32 @@ export class Db {
     return out;
   }
 
+  /** 某个月的全部日程（month = "YYYY-MM"），日历页用 */
+  static async eventsInMonth(month: string): Promise<EventRow[]> {
+    const predicates = new relationalStore.RdbPredicates('events');
+    predicates.like('date', `${month}-%`).orderByAsc('date');
+    const rows = await Db.need().query(predicates, [
+      'id', 'title', 'description', 'date', 'start_time', 'end_time',
+      'remind_minutes', 'color', 'done',
+    ]);
+    const out: EventRow[] = [];
+    while (rows.goToNextRow()) {
+      out.push({
+        id: rows.getLong(rows.getColumnIndex('id')),
+        title: rows.getString(rows.getColumnIndex('title')),
+        description: rows.getString(rows.getColumnIndex('description')),
+        date: rows.getString(rows.getColumnIndex('date')),
+        start_time: rows.getString(rows.getColumnIndex('start_time')),
+        end_time: rows.getString(rows.getColumnIndex('end_time')),
+        remind_minutes: rows.getLong(rows.getColumnIndex('remind_minutes')),
+        color: rows.getString(rows.getColumnIndex('color')),
+        done: rows.getLong(rows.getColumnIndex('done')) === 1,
+      });
+    }
+    rows.close();
+    return out;
+  }
+
   static async addEvent(input: NewEventInput): Promise<number> {
     const bucket: relationalStore.ValuesBucket = {
       title: input.title,

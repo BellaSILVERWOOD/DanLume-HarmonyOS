@@ -1,4 +1,4 @@
-import { Db } from '../common/Db';
+import { Db, EventRow } from '../common/Db';
 import { Api } from '../common/Api';
 
 interface ChatLine {
@@ -20,6 +20,15 @@ interface NoticeItem {
   title: string;
   body: string;
   created_at: string;
+}
+
+/** 日历月视图的一格（day = 0 表示补位空格） */
+interface DayCell {
+  day: number;
+  date: string;
+  count: number;
+  inMonth: boolean;
+  today: boolean;
 }
 
 @Entry
@@ -47,11 +56,18 @@ struct Index {
   // 行内编辑：editingId 是正在编辑的日程 id（0 = 没有在编辑）
   @State editingId: number = 0;
   @State editingTitle: string = '';
+  // 日历页：month = "YYYY-MM"
+  @State month: string = '';
+  @State monthRows: EventRow[] = [];
 
   aboutToAppear(): void {
     this.reloadToday();
     this.reloadAccount();
     this.reloadAi();
+    if (this.month.length === 0) {
+      this.month = this.today.slice(0, 7);
+    }
+    this.reloadMonth();
   }
 
   // ------------------------------------------------------------ 数据
@@ -61,6 +77,70 @@ struct Index {
       const item: EventItem = { id: row.id, title: row.title, start: row.start_time, done: row.done };
       return item;
     });
+  }
+
+  // ------------------------------------------------------------ 日历
+  async reloadMonth(): Promise<void> {
+    if (this.month.length === 0) {
+      this.month = this.today.slice(0, 7);
+    }
+    this.monthRows = await Db.eventsInMonth(this.month);
+  }
+
+  shiftMonth(delta: number): void {
+    const y = parseInt(this.month.slice(0, 4), 10);
+    const m = parseInt(this.month.slice(5, 7), 10) + delta;
+    const first = new Date(y, m - 1, 1);
+    const yy = first.getFullYear();
+    const mm = `${first.getMonth() + 1}`.padStart(2, '0');
+    this.month = `${yy}-${mm}`;
+    this.reloadMonth();
+  }
+
+  monthLabel(): string {
+    return `${this.month.slice(0, 4)} 年 ${parseInt(this.month.slice(5, 7), 10)} 月`;
+  }
+
+  countOn(date: string): number {
+    let count = 0;
+    for (const row of this.monthRows) {
+      if (row.date === date) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  weekCells(): DayCell[] {
+    const y = parseInt(this.month.slice(0, 4), 10);
+    const m = parseInt(this.month.slice(5, 7), 10);
+    const lead = new Date(y, m - 1, 1).getDay();
+    const days = new Date(y, m, 0).getDate();
+    const cells: DayCell[] = [];
+    for (let i = 0; i < lead; i += 1) {
+      cells.push({ day: 0, date: '', count: 0, inMonth: false, today: false });
+    }
+    const now = Db.today();
+    for (let d = 1; d <= days; d += 1) {
+      const date = `${this.month}-${`${d}`.padStart(2, '0')}`;
+      cells.push({
+        day: d,
+        date: date,
+        count: this.countOn(date),
+        inMonth: true,
+        today: date === now,
+      });
+    }
+    return cells;
+  }
+
+  openDay(date: string): void {
+    if (date.length === 0) {
+      return;
+    }
+    this.today = date;
+    this.currentTab = 0;
+    this.reloadToday();
   }
 
   async reloadAccount(): Promise<void> {
@@ -454,9 +534,80 @@ struct Index {
     .height('100%')
   }
 
+  @Builder
+  calendarTab() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        Button('‹')
+          .height(30)
+          .fontSize(14)
+          .backgroundColor('#eeeeee')
+          .fontColor('#2b2f36')
+          .onClick(() => { this.shiftMonth(-1); })
+        Text(this.monthLabel())
+          .fontSize(15)
+          .fontWeight(600)
+          .textAlign(TextAlign.Center)
+          .layoutWeight(1)
+        Button('›')
+          .height(30)
+          .fontSize(14)
+          .backgroundColor('#eeeeee')
+          .fontColor('#2b2f36')
+          .onClick(() => { this.shiftMonth(1); })
+      }
+      .width('100%')
+
+      Row() {
+        ForEach(['日', '一', '二', '三', '四', '五', '六'], (weekday: string) => {
+          Text(weekday)
+            .fontSize(11)
+            .fontColor('#8a8f98')
+            .textAlign(TextAlign.Center)
+            .layoutWeight(1)
+        }, (weekday: string) => weekday)
+      }
+      .width('100%')
+
+      Flex({ wrap: FlexWrap.Wrap }) {
+        ForEach(this.weekCells(), (cell: DayCell) => {
+          Column({ space: 2 }) {
+            Text(cell.day > 0 ? `${cell.day}` : '')
+              .fontSize(13)
+              .fontColor(cell.today ? '#c8546a' : (cell.inMonth ? '#2b2f36' : '#8a8f98'))
+            if (cell.count > 0) {
+              Text(`${cell.count}`)
+                .fontSize(10)
+                .fontColor('#ffffff')
+                .backgroundColor('#c8546a')
+                .borderRadius(6)
+                .padding({ left: 4, right: 4 })
+            }
+          }
+          .width('14.28%')
+          .height(48)
+          .justifyContent(FlexAlign.Center)
+          .alignItems(HorizontalAlign.Center)
+          .onClick(() => { this.openDay(cell.date); })
+        }, (cell: DayCell) => `${cell.date}-${cell.day}`)
+      }
+      .width('100%')
+      .layoutWeight(1)
+
+      Text(this.monthRows.length > 0 ? `本月 ${this.monthRows.length} 条日程` : '本月还没有日程')
+        .fontSize(12)
+        .fontColor('#8a8f98')
+        .width('100%')
+    }
+    .padding(16)
+    .width('100%')
+    .height('100%')
+  }
+
   build() {
     Tabs({ index: this.currentTab }) {
       TabContent() { this.todayTab() }.tabBar('今日')
+      TabContent() { this.calendarTab() }.tabBar('日历')
       TabContent() { this.chatTab() }.tabBar('梅子')
       TabContent() { this.meTab() }.tabBar('我的')
     }
@@ -464,6 +615,9 @@ struct Index {
       this.currentTab = index;
       // 提示是三个标签页共用的：切页时清掉，免得「登录失败」跑到「今日」上
       this.message = '';
+      if (index === 1) {
+        this.reloadMonth();
+      }
     })
     .barPosition(BarPosition.End)
     .width('100%')
