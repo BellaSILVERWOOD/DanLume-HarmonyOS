@@ -56,7 +56,11 @@ const SCHEMA: string[] = [
      repeat TEXT NOT NULL DEFAULT '',
      repeat_until TEXT NOT NULL DEFAULT '',
      done_dates TEXT NOT NULL DEFAULT '',
-     created_at TEXT NOT NULL DEFAULT ''
+     created_at TEXT NOT NULL DEFAULT '',
+     reminder_id INTEGER NOT NULL DEFAULT 0,
+     uid TEXT NOT NULL DEFAULT '',
+     updated_at TEXT NOT NULL DEFAULT '',
+     deleted INTEGER NOT NULL DEFAULT 0
    )`,
   `CREATE INDEX IF NOT EXISTS idx_events_date ON events(date)`,
   `CREATE TABLE IF NOT EXISTS memos (
@@ -91,24 +95,46 @@ export class Db {
     for (const sql of SCHEMA) {
       await store.executeSql(sql);
     }
-    await Db.ensureReminderColumn();
+    await Db.ensureColumns();
   }
 
-  /** 老库补 `reminder_id` 列（CREATE TABLE IF NOT EXISTS 不会改已存在的表） */
-  private static async ensureReminderColumn(): Promise<void> {
+  /** 老库补列：reminder_id / uid / updated_at / deleted，并给老日程补 uid */
+  private static async ensureColumns(): Promise<void> {
     const db = Db.need();
-    let has = false;
+    const have: string[] = [];
     const rows = await db.querySql('PRAGMA table_info(events)');
     while (rows.goToNextRow()) {
-      const name = rows.getString(rows.getColumnIndex('name'));
-      if (name === 'reminder_id') {
-        has = true;
-      }
+      have.push(rows.getString(rows.getColumnIndex('name')));
     }
     rows.close();
-    if (!has) {
-      await db.executeSql('ALTER TABLE events ADD COLUMN reminder_id INTEGER NOT NULL DEFAULT 0');
+    const wanted: string[] = ['reminder_id', 'uid', 'updated_at', 'deleted'];
+    for (const name of wanted) {
+      if (!have.includes(name)) {
+        if (name === 'reminder_id') {
+          await db.executeSql('ALTER TABLE events ADD COLUMN reminder_id INTEGER NOT NULL DEFAULT 0');
+        } else if (name === 'deleted') {
+          await db.executeSql('ALTER TABLE events ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0');
+        } else {
+          await db.executeSql(`ALTER TABLE events ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`);
+        }
+      }
     }
+    const missing = await db.querySql(`SELECT id FROM events WHERE uid = '' OR uid IS NULL`);
+    const ids: number[] = [];
+    while (missing.goToNextRow()) {
+      ids.push(missing.getLong(0));
+    }
+    missing.close();
+    for (const id of ids) {
+      const uid = `e_${id}_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+      await db.executeSql('UPDATE events SET uid = ?, updated_at = ? WHERE id = ?',
+        [uid, Db.isoNow(), id]);
+    }
+  }
+
+  /** UTC ISO（服务器同步用，字典序就是时间序） */
+  static isoNow(): string {
+    return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   }
 
   private static need(): relationalStore.RdbStore {
@@ -143,7 +169,7 @@ export class Db {
   // ---------------------------------------------------------------- 日程
   static async eventsOn(date: string): Promise<EventRow[]> {
     const predicates = new relationalStore.RdbPredicates('events');
-    predicates.equalTo('date', date).orderByAsc('start_time');
+    predicates.equalTo('date', date).and().equalTo('deleted', 0).orderByAsc('start_time');
     const rows = await Db.need().query(predicates, [
       'id', 'title', 'description', 'date', 'start_time', 'end_time',
       'remind_minutes', 'color', 'done', 'reminder_id',
@@ -170,7 +196,7 @@ export class Db {
   /** 某个月的全部日程（month = "YYYY-MM"），日历页用 */
   static async eventsInMonth(month: string): Promise<EventRow[]> {
     const predicates = new relationalStore.RdbPredicates('events');
-    predicates.like('date', `${month}-%`).orderByAsc('date');
+    predicates.like('date', `${month}-%`).and().equalTo('deleted', 0).orderByAsc('date');
     const rows = await Db.need().query(predicates, [
       'id', 'title', 'description', 'date', 'start_time', 'end_time',
       'remind_minutes', 'color', 'done', 'reminder_id',
@@ -195,6 +221,7 @@ export class Db {
   }
 
   static async addEvent(input: NewEventInput): Promise<number> {
+    const uid = `e_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
     const bucket: relationalStore.ValuesBucket = {
       title: input.title,
       description: input.description ?? '',
@@ -208,6 +235,9 @@ export class Db {
       repeat_until: '',
       done_dates: '',
       created_at: Db.stamp(),
+      uid: uid,
+      updated_at: Db.isoNow(),
+      deleted: 0,
     };
     return await Db.need().insert('events', bucket);
   }
@@ -215,7 +245,8 @@ export class Db {
   /** 导入前查重：同标题 + 同日期 + 同开始时间就当已经有了 */
   static async hasEvent(title: string, date: string, startTime: string): Promise<boolean> {
     const predicates = new relationalStore.RdbPredicates('events');
-    predicates.equalTo('title', title).and().equalTo('date', date).and().equalTo('start_time', startTime);
+    predicates.equalTo('title', title).and().equalTo('date', date).and()
+      .equalTo('start_time', startTime).and().equalTo('deleted', 0);
     const rows = await Db.need().query(predicates, ['id']);
     const has = rows.rowCount > 0;
     rows.close();
@@ -237,14 +268,118 @@ export class Db {
       repeat_until: '',
       done_dates: '',
       created_at: Db.stamp(),
+      uid: `e_${Date.now()}_${Math.floor(Math.random() * 100000)}`,
+      updated_at: Db.isoNow(),
+      deleted: 0,
     };
     return await Db.need().insert('events', bucket);
+  }
+
+  // ---------------------------------------------------------------- 多端同步
+  /** 导出本地比 since 新的日程（含墓碑），给 /api/v1/sync 用 */
+  static async syncExport(since: string): Promise<Object[]> {
+    const out: Object[] = [];
+    const rows = await Db.need().querySql(
+      'SELECT uid, title, description, date, start_time, end_time, remind_minutes, color, done, updated_at, deleted ' +
+      'FROM events WHERE updated_at > ?', [since]);
+    while (rows.goToNextRow()) {
+      const payload: Record<string, Object> = {
+        'title': rows.getString(1),
+        'description': rows.getString(2),
+        'date': rows.getString(3),
+        'start_time': rows.getString(4),
+        'end_time': rows.getString(5),
+        'remind_minutes': rows.getLong(6),
+        'color': rows.getString(7),
+        'done': rows.getLong(8) === 1,
+      };
+      const item: Record<string, Object> = {
+        'kind': 'event',
+        'uid': rows.getString(0),
+        'payload': JSON.stringify(payload),
+        'updated_at': rows.getString(9),
+        'deleted': rows.getLong(10) === 1,
+      };
+      out.push(item);
+    }
+    rows.close();
+    return out;
+  }
+
+  /** 把服务器上的一条日程合并进来（后写胜出） */
+  static async syncApplyEvent(uid: string, payloadJson: string, updatedAt: string,
+    deleted: boolean): Promise<void> {
+    if (uid.length === 0) {
+      return;
+    }
+    const existing = await Db.need().querySql(
+      'SELECT id, updated_at FROM events WHERE uid = ?', [uid]);
+    let id = 0;
+    let localUpdated = '';
+    if (existing.goToFirstRow()) {
+      id = existing.getLong(0);
+      localUpdated = existing.getString(1);
+    }
+    existing.close();
+    if (id > 0 && localUpdated >= updatedAt) {
+      return; // 本地更新，别被旧数据覆盖
+    }
+    if (deleted) {
+      if (id > 0) {
+        await Db.need().executeSql('UPDATE events SET deleted = 1, updated_at = ? WHERE id = ?',
+          [updatedAt, id]);
+      }
+      return;
+    }
+    let payload: Record<string, Object> = {};
+    try {
+      payload = JSON.parse(payloadJson) as Record<string, Object>;
+    } catch (e) {
+      return;
+    }
+    const title = `${payload['title'] ?? ''}`;
+    const description = `${payload['description'] ?? ''}`;
+    const date = `${payload['date'] ?? ''}`;
+    const start = `${payload['start_time'] ?? ''}`;
+    const end = `${payload['end_time'] ?? ''}`;
+    const remind = parseInt(`${payload['remind_minutes'] ?? '10'}`, 10);
+    const color = `${payload['color'] ?? ''}`;
+    const done = payload['done'] === true || `${payload['done'] ?? ''}` === 'true';
+    if (date.length === 0) {
+      return;
+    }
+    if (id > 0) {
+      await Db.need().executeSql(
+        'UPDATE events SET title = ?, description = ?, date = ?, start_time = ?, end_time = ?, ' +
+        'remind_minutes = ?, color = ?, done = ?, deleted = 0, updated_at = ? WHERE id = ?',
+        [title, description, date, start, end, isNaN(remind) ? 10 : remind, color,
+          done ? 1 : 0, updatedAt, id]);
+    } else {
+      const bucket: relationalStore.ValuesBucket = {
+        title: title,
+        description: description,
+        date: date,
+        start_time: start,
+        end_time: end,
+        remind_minutes: isNaN(remind) ? 10 : remind,
+        color: color,
+        done: done ? 1 : 0,
+        repeat: '',
+        repeat_until: '',
+        done_dates: '',
+        created_at: Db.stamp(),
+        uid: uid,
+        updated_at: updatedAt,
+        deleted: 0,
+      };
+      await Db.need().insert('events', bucket);
+    }
   }
 
   /** 按 id 取一条（AI 工具改 / 删前先看看有没有） */
   static async eventById(id: number): Promise<EventRow | null> {
     const predicates = new relationalStore.RdbPredicates('events');
-    predicates.equalTo('id', id);
+    predicates.equalTo('id', id).and().equalTo('deleted', 0);
     const rows = await Db.need().query(predicates, [
       'id', 'title', 'description', 'date', 'start_time', 'end_time',
       'remind_minutes', 'color', 'done', 'reminder_id',
@@ -272,27 +407,31 @@ export class Db {
   static async updateEventFields(id: number, title: string, date: string,
     startTime: string, endTime: string, done: boolean, description: string): Promise<void> {
     await Db.need().executeSql(
-      'UPDATE events SET title = ?, date = ?, start_time = ?, end_time = ?, done = ?, description = ? WHERE id = ?',
-      [title, date, startTime, endTime, done ? 1 : 0, description, id]);
+      'UPDATE events SET title = ?, date = ?, start_time = ?, end_time = ?, done = ?, description = ?, updated_at = ? WHERE id = ?',
+      [title, date, startTime, endTime, done ? 1 : 0, description, Db.isoNow(), id]);
   }
 
   static async setDone(id: number, done: boolean): Promise<void> {
-    await Db.need().executeSql('UPDATE events SET done = ? WHERE id = ?', [done ? 1 : 0, id]);
+    await Db.need().executeSql('UPDATE events SET done = ?, updated_at = ? WHERE id = ?',
+      [done ? 1 : 0, Db.isoNow(), id]);
   }
 
+  /** 删除用墓碑（deleted=1），同步时另一台设备才知道这条被删了 */
   static async deleteEvent(id: number): Promise<void> {
-    await Db.need().executeSql('DELETE FROM events WHERE id = ?', [id]);
+    await Db.need().executeSql('UPDATE events SET deleted = 1, updated_at = ? WHERE id = ?',
+      [Db.isoNow(), id]);
   }
 
   static async renameEvent(id: number, title: string): Promise<void> {
-    await Db.need().executeSql('UPDATE events SET title = ? WHERE id = ?', [title, id]);
+    await Db.need().executeSql('UPDATE events SET title = ?, updated_at = ? WHERE id = ?',
+      [title, Db.isoNow(), id]);
   }
 
   /** 日历页编辑：标题 + 开始/结束时间（日期与提醒不动） */
   static async updateEvent(id: number, title: string, startTime: string, endTime: string): Promise<void> {
     await Db.need().executeSql(
-      'UPDATE events SET title = ?, start_time = ?, end_time = ? WHERE id = ?',
-      [title, startTime, endTime, id]);
+      'UPDATE events SET title = ?, start_time = ?, end_time = ?, updated_at = ? WHERE id = ?',
+      [title, startTime, endTime, Db.isoNow(), id]);
   }
 
   /** 记下系统提醒 id（0 = 没设提醒） */

@@ -3,6 +3,7 @@ import { Api, PaperHit, AiProfile } from '../common/Api';
 import { importSystemCalendar, importDlpk, exportDayToSystem } from '../common/Migrate';
 import { PHONE_TOOL_NAMES, TOOL_LABELS, toolKey } from '../common/AiTools';
 import { sendMail, fetchInbox, fetchInboxList, fetchMailBody, MailHeader } from '../common/Mail';
+import { syncEvents } from '../common/Sync';
 import { parseMarkdown, MdBlock, MdKind, MdSpan } from '../common/Md';
 import common from '@ohos.app.ability.common';
 import reminderAgentManager from '@ohos.reminderAgentManager';
@@ -81,6 +82,7 @@ struct Index {
   @State mailBody: string = '';
   @State inboxList: MailHeader[] = [];
   @State inboxDetail: string = '';
+  @State syncing: boolean = false;
   // 小工具：备忘 / 倒计时 / 闪卡 / 番茄钟
   @State memos: string[] = [];
   @State memoDraft: string = '';
@@ -969,6 +971,24 @@ struct Index {
     }
   }
 
+  /** 多端同步：把本地改动推上去，同时拉回别的设备的改动 */
+  async doSync(): Promise<void> {
+    if (this.syncing) {
+      return;
+    }
+    this.syncing = true;
+    this.message = '正在同步…';
+    try {
+      this.message = await syncEvents();
+    } catch (err) {
+      this.message = `同步失败：${err}`;
+    }
+    this.syncing = false;
+    await this.reloadToday();
+    await this.reloadMonth();
+    await this.reloadDay();
+  }
+
   async pullAnnouncements(): Promise<void> {
     const items = await Api.announcements(0);
     const rows: NoticeItem[] = [];
@@ -1691,6 +1711,13 @@ struct Index {
         .backgroundColor('#eeeeee')
         .fontColor('#2b2f36')
         .onClick(() => { void this.pullAnnouncements(); })
+
+      Button(this.syncing ? '同步中…' : '同步日程到云端')
+        .height(40)
+        .width('100%')
+        .backgroundColor('#eeeeee')
+        .fontColor('#2b2f36')
+        .onClick(() => { void this.doSync(); })
 
       Text('服务器地址')
         .fontSize(13)
