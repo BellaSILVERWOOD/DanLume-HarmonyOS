@@ -1,5 +1,6 @@
 import { Db, EventRow } from '../common/Db';
 import { Api, PaperHit } from '../common/Api';
+import { parseMarkdown, MdBlock, MdKind, MdSpan } from '../common/Md';
 import common from '@ohos.app.ability.common';
 import reminderAgentManager from '@ohos.reminderAgentManager';
 import notificationManager from '@ohos.notificationManager';
@@ -605,8 +606,7 @@ struct Index {
             .width('100%')
             .padding(12)
             .borderRadius(12)
-            .backgroundColor('#D9FFFFFF')
-            .backgroundBlurStyle(BlurStyle.Thin)
+            .backgroundColor('#F7F7FA')
           }
         }, (item: EventItem) => `${item.id}`)
       }
@@ -618,30 +618,141 @@ struct Index {
     .height('100%')
   }
 
+  /** 行内样式：粗体 / 斜体 / 行内代码（一行文字里的 span 拼起来） */
+  @Builder
+  richSpans(spans: MdSpan[], size: number, color: string, heading: boolean) {
+    Text() {
+      ForEach(spans, (s: MdSpan, i: number) => {
+        Span(s.text)
+          .fontSize(s.code ? size - 1 : size)
+          .fontColor(s.code ? '#c8546a' : color)
+          .fontWeight(s.bold || heading ? FontWeight.Bold : FontWeight.Normal)
+          .fontStyle(s.italic ? FontStyle.Italic : FontStyle.Normal)
+          .textBackgroundStyle(s.code
+            ? { color: '#F2F2F7', radius: 4 } as TextBackgroundStyle
+            : { color: Color.Transparent, radius: 0 } as TextBackgroundStyle)
+      }, (s: MdSpan, i: number) => `${i}-${s.text.length}`)
+    }
+    .lineHeight(size * 1.65)
+    .width('100%')
+  }
+
+  /** Markdown 渲染：标题 / 段落 / 列表 / 引用 / 分隔线 / 代码块 */
+  @Builder
+  mdView(src: string) {
+    Column({ space: 9 }) {
+      ForEach(parseMarkdown(src), (b: MdBlock, idx: number) => {
+        if (b.kind === MdKind.Code) {
+          Column() {
+            Row({ space: 8 }) {
+              Text(b.lang.length > 0 ? b.lang : '代码')
+                .fontSize(11)
+                .fontColor('#8a8f98')
+                .layoutWeight(1)
+              Image($r('app.media.md_copy'))
+                .width(15)
+                .height(15)
+                .fillColor('#8a8f98')
+                .onClick(() => { this.copyText(b.code); })
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 8, bottom: 6 })
+
+            Scroll() {
+              Text(b.code)
+                .fontSize(13)
+                .lineHeight(19)
+                .fontColor('#1f2328')
+                .fontFamily('monospace')
+                .padding({ left: 12, right: 12, bottom: 12 })
+                .textAlign(TextAlign.Start)
+            }
+            .scrollable(ScrollDirection.Horizontal)
+            .scrollBar(BarState.Off)
+            .align(Alignment.TopStart)
+            .width('100%')
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .backgroundColor('#F4F4F7')
+          .borderRadius(12)
+        } else if (b.kind === MdKind.Rule) {
+          Divider().color('#E5E7EB')
+        } else if (b.kind === MdKind.Bullet || b.kind === MdKind.Ordered) {
+          Row({ space: 8 }) {
+            Text(b.marker)
+              .fontSize(15)
+              .lineHeight(15 * 1.65)
+              .fontColor('#2b2f36')
+            Column() {
+              this.richSpans(b.spans, 15, '#2b2f36', false)
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Top)
+          .padding({ left: 2 })
+        } else if (b.kind === MdKind.Quote) {
+          Column() {
+            this.richSpans(b.spans, 14, '#5c6270', false)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .padding({ left: 10, top: 2, bottom: 2 })
+          .border({ width: { left: 3 }, color: '#E3E4E8' })
+        } else if (b.kind === MdKind.Heading) {
+          Column() {
+            this.richSpans(b.spans, b.level <= 2 ? 19 : 16, '#2b2f36', true)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .margin({ top: idx === 0 ? 0 : 4 })
+        } else {
+          Column() {
+            this.richSpans(b.spans, 15, '#2b2f36', false)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+        }
+      }, (b: MdBlock, idx: number) => `${idx}-${b.kind}-${b.code.length}`)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
   @Builder
   chatTab() {
     Column({ space: 10 }) {
       Row({ space: 8 }) {
         Stack() {
+          Row() {}
+            .width(40)
+            .height(40)
+            .borderRadius(20)
+            .backgroundColor('#CCE9E9EF')
+            .backgroundBlurStyle(BlurStyle.Thick)
+            .border({ width: 1, color: '#F2FFFFFF' })
+            .shadow({ radius: 10, color: '#0F2A2A40', offsetY: 3 })
           Text('☰').fontSize(18).fontColor('#2b2f36')
         }
         .width(40)
         .height(40)
-        .borderRadius(20)
-        .backgroundColor('#40FFFFFF')
-        .backgroundBlurStyle(BlurStyle.Thick)
-        .border({ width: 1, color: '#80FFFFFF' })
         .onClick(() => { this.message = '历史聊天：下一步接 chat_sessions'; })
         Text('梅子').fontSize(16).fontWeight(600).layoutWeight(1).textAlign(TextAlign.Center)
         Stack() {
+          Row() {}
+            .width(40)
+            .height(40)
+            .borderRadius(20)
+            .backgroundColor('#CCE9E9EF')
+            .backgroundBlurStyle(BlurStyle.Thick)
+            .border({ width: 1, color: '#F2FFFFFF' })
+            .shadow({ radius: 10, color: '#0F2A2A40', offsetY: 3 })
           Text('✎').fontSize(18).fontColor('#2b2f36')
         }
         .width(40)
         .height(40)
-        .borderRadius(20)
-        .backgroundColor('#40FFFFFF')
-        .backgroundBlurStyle(BlurStyle.Thick)
-        .border({ width: 1, color: '#80FFFFFF' })
         .onClick(() => { this.clearChat(); })
       }
       .width('100%')
@@ -665,28 +776,47 @@ struct Index {
             ListItem() {
               Column({ space: 4 }) {
                 Row() {
-                  Text(line.text)
-                    .fontSize(15)
-                    .lineHeight(22)
-                    .padding(line.role === 'user' ? 12 : 0)
-                    .borderRadius(20)
-                    .backgroundColor(line.role === 'user' ? '#E7E1FB' : Color.Transparent)
-                    .constraintSize({ maxWidth: '84%' })
+                  if (line.role === 'user') {
+                    Text(line.text)
+                      .fontSize(15)
+                      .lineHeight(22)
+                      .padding(12)
+                      .borderRadius(20)
+                      .backgroundColor('#E7E1FB')
+                      .constraintSize({ maxWidth: '84%' })
+                  } else {
+                    Column() {
+                      this.mdView(line.text)
+                    }
+                    .width('100%')
+                    .alignItems(HorizontalAlign.Start)
+                  }
                 }
                 .width('100%')
                 .justifyContent(line.role === 'user' ? FlexAlign.End : FlexAlign.Start)
                 if (line.role === 'assistant') {
-                  Row({ space: 16 }) {
-                    Text('复制')
-                      .fontSize(12)
-                      .fontColor('#8a8f98')
-                      .onClick(() => { this.copyText(line.text); })
-                    Text('重新生成')
-                      .fontSize(12)
-                      .fontColor('#8a8f98')
-                      .onClick(() => { void this.regenerate(); })
+                  Row({ space: 6 }) {
+                    Column() {
+                      Image($r('app.media.md_copy')).width(16).height(16).fillColor('#8a8f98')
+                    }
+                    .width(30)
+                    .height(30)
+                    .borderRadius(15)
+                    .backgroundColor('#F2F2F7')
+                    .justifyContent(FlexAlign.Center)
+                    .onClick(() => { this.copyText(line.text); })
+                    Column() {
+                      Image($r('app.media.md_refresh')).width(16).height(16).fillColor('#8a8f98')
+                    }
+                    .width(30)
+                    .height(30)
+                    .borderRadius(15)
+                    .backgroundColor('#F2F2F7')
+                    .justifyContent(FlexAlign.Center)
+                    .onClick(() => { void this.regenerate(); })
                   }
                   .width('100%')
+                  .margin({ top: 2 })
                 }
               }
               .width('100%')
@@ -697,54 +827,69 @@ struct Index {
         .width('100%')
       }
 
-      // 发送框：磨砂玻璃胶囊（对标 ChatGPT：+ / 输入 / 语音 / ↑）
-      Row({ space: 6 }) {
-        Stack() {
-          Text('+').fontSize(22).fontColor('#3a3a40')
-        }
-        .width(36)
-        .height(36)
-        .borderRadius(18)
-        .backgroundColor('#40FFFFFF')
-        .backgroundBlurStyle(BlurStyle.Thick)
-        .onClick(() => { this.message = '附件功能待接入'; })
-        TextInput({ text: this.chatDraft, placeholder: 'Ask 梅子…' })
-          .layoutWeight(1)
-          .height(44)
-          .fontSize(15)
-          .backgroundColor(Color.Transparent)
-          .onChange((value: string) => { this.chatDraft = value; })
-        Stack() {
-          Text(this.listening ? '停' : '语音')
-            .fontSize(this.listening ? 14 : 11)
-            .fontColor('#3a3a40')
-        }
-        .width(36)
-        .height(36)
-        .borderRadius(18)
-        .backgroundColor(this.listening ? '#59FFD9D9' : '#40FFFFFF')
-        .backgroundBlurStyle(BlurStyle.Thick)
-        .onClick(() => { void this.toggleVoice(); })
-        Stack() {
-          Text(this.asking ? '…' : '↑').fontSize(18).fontColor(Color.White)
-        }
-        .width(36)
-        .height(36)
-        .borderRadius(18)
-        .backgroundColor(this.chatDraft.trim().length > 0 ? '#c8546a' : '#C7C7CC')
-        .onClick(() => {
-          if (!this.asking) {
-            void this.askMeizi();
+      // 发送框：底层磨砂负责模糊，上层只放文字/输入（避免文字被画进模糊层）
+      Stack() {
+        Row() {}
+          .width('100%')
+          .height(56)
+          .borderRadius(28)
+          .backgroundColor('#40FFFFFF')
+          .backgroundBlurStyle(BlurStyle.Thick)
+          .border({ width: 1, color: '#80FFFFFF' })
+          .shadow({ radius: 18, color: '#1A2A2A40', offsetY: 6 })
+        Row({ space: 6 }) {
+          Stack() {
+            Row() {}
+              .width(36)
+              .height(36)
+              .borderRadius(18)
+              .backgroundColor('#40FFFFFF')
+              .backgroundBlurStyle(BlurStyle.Thick)
+            Text('+').fontSize(22).fontColor('#3a3a40')
           }
-        })
+          .width(36)
+          .height(36)
+          .onClick(() => { this.message = '附件功能待接入'; })
+          TextInput({ text: this.chatDraft, placeholder: 'Ask 梅子…' })
+            .layoutWeight(1)
+            .height(44)
+            .fontSize(15)
+            .backgroundColor(Color.Transparent)
+            .onChange((value: string) => { this.chatDraft = value; })
+          Stack() {
+            Row() {}
+              .width(36)
+              .height(36)
+              .borderRadius(18)
+              .backgroundColor(this.listening ? '#59FFD9D9' : '#40FFFFFF')
+              .backgroundBlurStyle(BlurStyle.Thick)
+            Text(this.listening ? '停' : '语音')
+              .fontSize(this.listening ? 14 : 11)
+              .fontColor('#3a3a40')
+          }
+          .width(36)
+          .height(36)
+          .onClick(() => { void this.toggleVoice(); })
+          Stack() {
+            Row() {}
+              .width(36)
+              .height(36)
+              .borderRadius(18)
+              .backgroundColor(this.chatDraft.trim().length > 0 ? '#c8546a' : '#C7C7CC')
+            Text(this.asking ? '…' : '↑').fontSize(18).fontColor(Color.White)
+          }
+          .width(36)
+          .height(36)
+          .onClick(() => {
+            if (!this.asking) {
+              void this.askMeizi();
+            }
+          })
+        }
+        .width('100%')
+        .padding({ left: 8, right: 8, top: 6, bottom: 6 })
       }
       .width('100%')
-      .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .borderRadius(26)
-      .backgroundColor('#40FFFFFF')
-      .backgroundBlurStyle(BlurStyle.Thick)
-      .border({ width: 1, color: '#80FFFFFF' })
-      .shadow({ radius: 18, color: '#1A2A2A40', offsetY: 6 })
     }
     .padding(16)
     .width('100%')
@@ -844,8 +989,7 @@ struct Index {
           .width('100%')
           .padding(10)
           .borderRadius(10)
-          .backgroundColor('#D9FFFFFF')
-          .backgroundBlurStyle(BlurStyle.Thin)
+          .backgroundColor('#F7F7FA')
         }, (notice: NoticeItem) => `${notice.id}`)
       }
 
@@ -901,8 +1045,7 @@ struct Index {
             .width('100%')
             .padding(10)
             .borderRadius(10)
-            .backgroundColor('#D9FFFFFF')
-            .backgroundBlurStyle(BlurStyle.Thin)
+            .backgroundColor('#F7F7FA')
             .onClick(() => { this.openLink(paper.url); })
           }
         }, (paper: PaperHit) => paper.url + paper.title)
@@ -1002,10 +1145,7 @@ struct Index {
       }
     })
     .barPosition(BarPosition.End)
-    .linearGradient({
-      angle: 160,
-      colors: [['#EADFFF', 0.0], ['#D9EAFF', 0.55], ['#FFE6D9', 1.0]],
-    })
+    .backgroundColor(Color.White)
     .width('100%')
     .height('100%')
   }
