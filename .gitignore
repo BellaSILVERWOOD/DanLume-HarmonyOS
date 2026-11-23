@@ -1,0 +1,28 @@
+# HarmonyOS / DevEco Studio
+/node_modules
+/oh_modules
+**/node_modules
+**/oh_modules
+**/build
+/.hvigor
+/.idea
+/local.properties
+*.hap
+*.app
+*.hsp
+*.har
+
+# 签名材料（绝不进仓库）
+*.p12
+*.cer
+*.p7b
+*.jks
+*.keystore
+signing/
+
+# 本地备份与杂项
+*.bak
+*.bak-*
+*.log
+.DS_Store
+Thumbs.db
