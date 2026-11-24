@@ -13,12 +13,14 @@
  * 说明：鸿蒙这边**没有做流式**，AI 是「整段拿到再渲染」；桌面版是 SSE 流式。
  */
 import http from '@ohos.net.http';
+import buffer from '@ohos.buffer';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import zlib from '@ohos.zlib';
 import deviceInfo from '@ohos.deviceInfo';
 import common from '@ohos.app.ability.common';
 import { Db, ChatMessageRow, MemoryRow } from './Db';
 import { enabledToolSpecs, PHONE_TOOL_NAMES, TOOL_LABELS } from './AiTools';
+import { streamPost } from './Stream';
 import { sendMail, fetchInbox } from './Mail';
 
 export interface LoginResult {
@@ -44,6 +46,23 @@ export class AiProfile {
     this.model = model;
     this.key = key;
   }
+}
+
+/** 一轮对话（按真实顺序带上助手回答，模型才知道前面已经答过什么） */
+export class ChatTurn {
+  role: string = '';
+  text: string = '';
+
+  constructor(role: string, text: string) {
+    this.role = role;
+    this.text = text;
+  }
+}
+
+/** 一次回答：正文 + 推理模型的思考过程 */
+export class ChatReply {
+  text: string = '';
+  reasoning: string = '';
 }
 
 /** 导出给 Index.ets 用；不导出的话 ArkTS 会说找不到 */
@@ -131,6 +150,24 @@ async function request(
     client.destroy();
   }
 }
+
+/** 一轮流式请求的汇总 */
+class StreamResult {
+  content: string = '';
+  reasoning: string = '';
+  toolCalls: Object[] = [];
+}
+
+/** 流式 delta 里逐片拼起来的工具调用 */
+class ToolDelta {
+  id: string = '';
+  name: string = '';
+  args: string = '';
+}
+
+const TOOL_HINT: string = '本次会话你可以调用工具直接读写这台手机上的日程、备忘、记忆和本地设置。' +
+  '涉及日程的请求：先 schedule_list 查清楚现状，需要时再 schedule_add / schedule_update / schedule_delete；' +
+  '用户让你记住什么就用 memory_add。改完用一句话说明改了什么。时间用 24 小时制 HH:MM，日期用 YYYY-MM-DD。';
 
 export class Api {
   static async serverUrl(): Promise<string> {
@@ -290,7 +327,265 @@ export class Api {
     await Db.setSetting('ai_model', name); // 兼容还没升级的旧路径
   }
 
-  static async chat(userText: string, history: string[]): Promise<string> {
+  /** 流式对话：边收边回调（text 是累计正文，reasoning 是累计思考过程） */
+  static async chatStreaming(userText: string, turns: ChatTurn[],
+    onDelta: (text: string, reasoning: string) => void): Promise<string> {
+    const profile = await Api.activeProfile();
+    if (profile === null || profile.key.trim().length === 0) {
+      throw new Error('还没配置 AI 接口（我的 → AI 接口）');
+    }
+    await Db.bumpCounter('usage_ai_calls');
+    const base = profile.base.trim().length > 0 ? profile.base.trim() : DEFAULT_BASE_URL;
+    const model = profile.model.trim().length > 0 ? profile.model.trim() : DEFAULT_MODEL;
+    const messages: Object[] = [Api.msg('system', PERSONA)];
+    for (const turn of turns) {
+      messages.push(Api.msg(turn.role, turn.text));
+    }
+    messages.push(Api.msg('user', userText));
+    const tools = await enabledToolSpecs();
+    if (tools.length > 0) {
+      messages.push(Api.msg('system', TOOL_HINT));
+    }
+    let visible = '';
+    let reasoningAll = '';
+    for (let round = 0; round < 4; round += 1) {
+      const before = visible;
+      let result: StreamResult;
+      try {
+        result = await Api.streamOnceRaw(base, model, profile.key, messages, tools,
+          (text: string, reasoning: string) => {
+            onDelta(before + text, reasoningAll + reasoning);
+          });
+      } catch (e) {
+        console.info(`[ai] raw stream failed: ${e}, fallback to non-stream`);
+        const full = await Api.chat(userText, turns);
+        onDelta(full.text, reasoningAll + full.reasoning);
+        return full.text;
+      }
+      visible += result.content;
+      reasoningAll += result.reasoning;
+      onDelta(visible, reasoningAll);
+      if (result.toolCalls.length === 0) {
+        if (visible.length === 0) {
+          // 流式没拿到内容（服务端不支持 SSE 或解析失败）→ 退回整段请求，至少保证有回答
+          console.info('[ai] stream empty, fallback to non-stream');
+          const full = await Api.chat(userText, turns);
+          onDelta(full.text, reasoningAll + full.reasoning);
+          return full.text;
+        }
+        return visible;
+      }
+      const assistant: Record<string, Object> = {
+        'role': 'assistant',
+        'content': result.content,
+        'tool_calls': result.toolCalls,
+      };
+      messages.push(assistant);
+      for (const raw of result.toolCalls) {
+        const call = raw as Record<string, Object>;
+        const fn = call['function'] as Record<string, Object>;
+        const name = `${fn['name'] ?? ''}`;
+        const args = `${fn['arguments'] ?? '{}'}`;
+        const callId = `${call['id'] ?? ''}`;
+        let out = '';
+        try {
+          out = await Api.runTool(name, args);
+        } catch (e) {
+          out = `工具执行失败：${e}`;
+        }
+        console.info(`[ai] tool ${name}(${args}) -> ${out}`);
+        const toolMsg: Record<string, string> = {
+          'role': 'tool',
+          'tool_call_id': callId,
+          'content': out,
+        };
+        messages.push(toolMsg);
+      }
+    }
+    return visible;
+  }
+
+  /** 发一次 stream=true 的请求，按 SSE 增量回调 */
+  private static async streamOnce(base: string, model: string, key: string, messages: Object[],
+    tools: Object[], onDelta: (text: string, reasoning: string) => void): Promise<StreamResult> {
+    const result = new StreamResult();
+    const body: Record<string, Object> = {
+      'model': model,
+      'messages': messages,
+      'temperature': 0.7,
+      'stream': true,
+    };
+    if (tools.length > 0) {
+      body['tools'] = tools;
+      body['tool_choice'] = 'auto';
+    }
+    const client = http.createHttp();
+    const deltas: ToolDelta[] = [];
+    let buf = '';
+    let chunks = 0;
+    client.on('dataReceive', (chunk: ArrayBuffer) => {
+      chunks += 1;
+      buf += buffer.from(chunk).toString('utf8');
+      let cut = buf.indexOf('\n\n');
+      while (cut >= 0) {
+        const event = buf.substring(0, cut);
+        buf = buf.substring(cut + 2);
+        Api.applySse(event, result, deltas, onDelta);
+        cut = buf.indexOf('\n\n');
+      }
+    });
+    try {
+      const res = await client.request(`${base}/chat/completions`, {
+        method: http.RequestMethod.POST,
+        header: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`,
+        },
+        extraData: JSON.stringify(body),
+        expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        connectTimeout: 15000,
+        readTimeout: 180000,
+      });
+      if (res.responseCode !== 200) {
+        throw new Error(`AI 返回 ${res.responseCode}`);
+      }
+      console.info(`[ai] stream code=200 chunks=${chunks} content=${result.content.length} reasoning=${result.reasoning.length}`);
+      // dataReceive 没触发时，整段响应体里其实也是 SSE 文本，自己再解析一遍
+      if (result.content.length === 0 && result.reasoning.length === 0) {
+        const bodyText = typeof res.result === 'string'
+          ? res.result
+          : buffer.from(res.result as ArrayBuffer).toString('utf8');
+        if (bodyText.indexOf('data:') >= 0) {
+          for (const part of bodyText.split('\n\n')) {
+            Api.applySse(part, result, deltas, onDelta);
+          }
+        }
+      }
+    } finally {
+      client.destroy();
+    }
+    if (buf.trim().length > 0) {
+      Api.applySse(buf, result, deltas, onDelta);
+    }
+    for (const delta of deltas) {
+      if (delta.name.length === 0) {
+        continue;
+      }
+      const fn: Record<string, string> = { 'name': delta.name, 'arguments': delta.args };
+      const call: Record<string, Object> = {
+        'id': delta.id,
+        'type': 'function',
+        'function': fn,
+      };
+      result.toolCalls.push(call);
+    }
+    return result;
+  }
+
+  /** 走自己实现的 HTTPS（Stream.ets）做流式：http 模块的 dataReceive 在真机上不触发 */
+  private static async streamOnceRaw(base: string, model: string, key: string, messages: Object[],
+    tools: Object[], onDelta: (text: string, reasoning: string) => void): Promise<StreamResult> {
+    const result = new StreamResult();
+    const body: Record<string, Object> = {
+      'model': model,
+      'messages': messages,
+      'temperature': 0.7,
+      'stream': true,
+    };
+    if (tools.length > 0) {
+      body['tools'] = tools;
+      body['tool_choice'] = 'auto';
+    }
+    const deltas: ToolDelta[] = [];
+    const code = await streamPost(`${base}/chat/completions`, {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${key}`,
+    }, JSON.stringify(body), (event: string) => {
+      Api.applySse(event, result, deltas, onDelta);
+    });
+    if (code !== 200) {
+      throw new Error(`AI 返回 ${code}`);
+    }
+    console.info(`[ai] raw stream code=${code} content=${result.content.length} reasoning=${result.reasoning.length}`);
+    for (const delta of deltas) {
+      if (delta.name.length === 0) {
+        continue;
+      }
+      const fn: Record<string, string> = { 'name': delta.name, 'arguments': delta.args };
+      const call: Record<string, Object> = {
+        'id': delta.id,
+        'type': 'function',
+        'function': fn,
+      };
+      result.toolCalls.push(call);
+    }
+    return result;
+  }
+
+  private static applySse(event: string, result: StreamResult, deltas: ToolDelta[],
+    onDelta: (text: string, reasoning: string) => void): void {
+    for (const line of event.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) {
+        continue;
+      }
+      const payload = trimmed.substring(5).trim();
+      if (payload.length === 0 || payload === '[DONE]') {
+        continue;
+      }
+      let data: Record<string, Object>;
+      try {
+        data = JSON.parse(payload) as Record<string, Object>;
+      } catch (e) {
+        continue;
+      }
+      const choices = data['choices'] as Object[] | undefined;
+      if (choices === undefined || choices.length === 0) {
+        continue;
+      }
+      const delta = (choices[0] as Record<string, Object>)['delta'] as Record<string, Object> | undefined;
+      if (delta === undefined) {
+        continue;
+      }
+      const content = `${delta['content'] ?? ''}`;
+      const reasoning = `${delta['reasoning_content'] ?? ''}`;
+      if (content.length > 0) {
+        result.content += content;
+      }
+      if (reasoning.length > 0) {
+        result.reasoning += reasoning;
+      }
+      if (content.length > 0 || reasoning.length > 0) {
+        onDelta(result.content, result.reasoning);
+      }
+      const calls = delta['tool_calls'] as Object[] | undefined;
+      if (calls === undefined) {
+        continue;
+      }
+      for (const raw of calls) {
+        const c = raw as Record<string, Object>;
+        const idx = parseInt(`${c['index'] ?? '0'}`, 10);
+        while (deltas.length <= (isNaN(idx) ? 0 : idx)) {
+          deltas.push(new ToolDelta());
+        }
+        const target = deltas[isNaN(idx) ? 0 : idx];
+        if (c['id'] !== undefined) {
+          target.id = `${c['id']}`;
+        }
+        const fn = c['function'] as Record<string, Object> | undefined;
+        if (fn !== undefined) {
+          if (fn['name'] !== undefined) {
+            target.name += `${fn['name']}`;
+          }
+          if (fn['arguments'] !== undefined) {
+            target.args += `${fn['arguments']}`;
+          }
+        }
+      }
+    }
+  }
+
+  static async chat(userText: string, turns: ChatTurn[]): Promise<ChatReply> {
     const profile = await Api.activeProfile();
     if (profile === null || profile.key.trim().length === 0) {
       throw new Error('还没配置 AI 接口（我的 → AI 接口）');
@@ -300,17 +595,17 @@ export class Api {
     const model = profile.model.trim().length > 0 ? profile.model.trim() : DEFAULT_MODEL;
     const messages: Object[] = [];
     messages.push(Api.msg('system', PERSONA));
-    for (const line of history) {
-      messages.push(Api.msg('user', line));
+    for (const turn of turns) {
+      messages.push(Api.msg(turn.role, turn.text));
     }
     messages.push(Api.msg('user', userText));
 
     // 设置里开了「AI 工具」才会带 tools 过去，否则跟以前一样纯聊天
     const tools = await enabledToolSpecs();
     if (tools.length > 0) {
-      messages.push(Api.msg('system',
-        '本次会话你可以调用工具直接读写这台手机上的日程和本地设置。涉及日程的请求：先 schedule_list 查清楚现状，需要时再 schedule_add / schedule_update / schedule_delete；改完用一句话说明改了什么。时间一律用 24 小时制 HH:MM，日期用 YYYY-MM-DD。'));
+      messages.push(Api.msg('system', TOOL_HINT));
     }
+    let reasoning = '';
     for (let round = 0; round < 4; round += 1) {
       const body: Record<string, Object> = {
         'model': model,
@@ -329,13 +624,17 @@ export class Api {
       const data = JSON.parse(result.body) as Record<string, Object>;
       const choices = data['choices'] as Object[] | undefined;
       if (!choices || choices.length === 0) {
-        return '（模型没有返回内容）';
+        return Api.reply('（模型没有返回内容）', reasoning);
       }
       const message = (choices[0] as Record<string, Object>)['message'] as Record<string, Object>;
       const content = `${message['content'] ?? ''}`;
+      const why = `${message['reasoning_content'] ?? ''}`;
+      if (why.length > 0) {
+        reasoning += why;
+      }
       const calls = message['tool_calls'] as Object[] | undefined;
       if (!calls || calls.length === 0) {
-        return content;
+        return Api.reply(content, reasoning);
       }
       // 有工具调用：把模型的这条消息原样塞回去，再逐条执行 + 回填结果
       messages.push(message);
@@ -355,7 +654,14 @@ export class Api {
         Api.pushToolResult(messages, callId, out);
       }
     }
-    return '（工具调用轮次太多，先停下了）';
+    return Api.reply('（工具调用轮次太多，先停下了）', reasoning);
+  }
+
+  private static reply(text: string, reasoning: string): ChatReply {
+    const out = new ChatReply();
+    out.text = text;
+    out.reasoning = reasoning;
+    return out;
   }
 
   private static msg(role: string, content: string): Object {
@@ -528,10 +834,10 @@ export class Api {
       }
       const out: string[] = [];
       for (const row of rows) {
-        const text = row.content.length > 80 ? `${row.content.substring(0, 80)}…` : row.content;
-        out.push(`${row.id} | ${row.title} | ${row.folder} | ${text}`);
+        // 记忆内容原样给出（不截断），标题和文件夹用于定位
+        out.push(`${row.id} | ${row.title} | ${row.folder} | ${row.content}`);
       }
-      return out.join('\n');
+      return out.join('\n---\n');
     }
     if (name === 'memory_delete') {
       const id = numOf('id', 0);
@@ -815,6 +1121,55 @@ export class Api {
     }
   }
 
+  // ---------------------------------------------------------------- 文献辅助
+  /** 一次不带 tools 的单轮对话（概要 / 流程图 共用） */
+  static async chatOnce(systemPrompt: string, userText: string): Promise<string> {
+    const profile = await Api.activeProfile();
+    if (profile === null || profile.key.trim().length === 0) {
+      throw new Error('还没配置 AI 接口');
+    }
+    const base = profile.base.trim().length > 0 ? profile.base.trim() : DEFAULT_BASE_URL;
+    const model = profile.model.trim().length > 0 ? profile.model.trim() : DEFAULT_MODEL;
+    const payload: ChatPayload = {
+      model: model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userText },
+      ],
+      temperature: 0.3,
+    };
+    const result = await request(
+      http.RequestMethod.POST, `${base}/chat/completions`, JSON.stringify(payload), profile.key);
+    if (result.code !== 200) {
+      throw new Error(`AI 返回 ${result.code}`);
+    }
+    const data = JSON.parse(result.body) as Record<string, Object>;
+    const choices = data['choices'] as Object[] | undefined;
+    if (choices === undefined || choices.length === 0) {
+      return '（模型没有返回内容）';
+    }
+    const message = (choices[0] as Record<string, Object>)['message'] as Record<string, Object>;
+    return `${message['content'] ?? ''}`;
+  }
+
+  static async paperSummary(title: string, abstractText: string): Promise<string> {
+    const sys = '你是科研助手。用中文写一段不超过 300 字的概要，再列 3-5 条要点（用「-」开头）。不要编造原文没有的信息。';
+    return await Api.chatOnce(sys, `标题：${title}\n\n摘要：${abstractText}`);
+  }
+
+  static async paperFlowchart(title: string, abstractText: string): Promise<string> {
+    const sys = '你是科研助手。把这篇论文的方法整理成步骤流程图，用纯文本，每行一步，形如 "1. …"，6-10 步；不要输出代码或其它说明。';
+    return await Api.chatOnce(sys, `标题：${title}\n\n摘要：${abstractText}`);
+  }
+
+  /** 下载 PDF 到应用目录，返回路径（失败返回空串） */
+  static async downloadPaperUrl(url: string, filename: string): Promise<string> {
+    const name = filename.length > 0 ? filename : `paper_${Date.now()}.pdf`;
+    const path = Api.resolvePath(name);
+    const ok = await Api.downloadTo(url, path);
+    return ok ? path : '';
+  }
+
   /** 相对路径落到应用 filesDir 下 */
   private static resolvePath(p: string): string {
     if (p.startsWith('/')) {
@@ -1005,9 +1360,9 @@ export class Api {
   }
 
   // ---------------------------------------------------------------- 文献（arXiv）
-  static async arxivSearch(query: string, limit: number = 8): Promise<PaperHit[]> {
+  static async arxivSearch(query: string, limit: number = 8, start: number = 0): Promise<PaperHit[]> {
     const text = encodeURIComponent(query.trim());
-    const url = `https://export.arxiv.org/api/query?search_query=all:${text}&start=0&max_results=${limit}`;
+    const url = `https://export.arxiv.org/api/query?search_query=all:${text}&start=${start}&max_results=${limit}`;
     const result = await request(http.RequestMethod.GET, url, null, null);
     if (result.code !== 200) {
       return [];

@@ -52,6 +52,21 @@ export interface MemoryRow {
   updated_at: string;
 }
 
+/** 我的文献库里的一篇 */
+export interface PaperRow {
+  id: number;
+  title: string;
+  authors: string;
+  year: string;
+  url: string;
+  summary: string;
+  note: string;
+  stars: number;
+  color: string;
+  /** 已下载的 PDF 本地路径（空 = 还没下载） */
+  filePath: string;
+}
+
 /** 新建日程的入参（ArkTS 不允许把对象字面量直接当类型，必须显式声明） */
 export interface NewEventInput {
   title: string;
@@ -124,6 +139,20 @@ const SCHEMA: string[] = [
      created_at TEXT NOT NULL DEFAULT '',
      updated_at TEXT NOT NULL DEFAULT ''
    )`,
+  `CREATE TABLE IF NOT EXISTS papers (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     title TEXT NOT NULL DEFAULT '',
+     authors TEXT NOT NULL DEFAULT '',
+     year TEXT NOT NULL DEFAULT '',
+     url TEXT NOT NULL DEFAULT '',
+     summary TEXT NOT NULL DEFAULT '',
+     note TEXT NOT NULL DEFAULT '',
+     stars INTEGER NOT NULL DEFAULT 0,
+     color TEXT NOT NULL DEFAULT '',
+     file_path TEXT NOT NULL DEFAULT '',
+     created_at TEXT NOT NULL DEFAULT '',
+     updated_at TEXT NOT NULL DEFAULT ''
+   )`,
 ];
 
 let store: relationalStore.RdbStore | null = null;
@@ -161,6 +190,16 @@ export class Db {
           await db.executeSql(`ALTER TABLE events ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`);
         }
       }
+    }
+    // papers.file_path：老库（建表时还没有这一列）补上
+    const paperCols: string[] = [];
+    const pr = await db.querySql('PRAGMA table_info(papers)');
+    while (pr.goToNextRow()) {
+      paperCols.push(pr.getString(pr.getColumnIndex('name')));
+    }
+    pr.close();
+    if (paperCols.length > 0 && !paperCols.includes('file_path')) {
+      await db.executeSql("ALTER TABLE papers ADD COLUMN file_path TEXT NOT NULL DEFAULT ''");
     }
     const missing = await db.querySql(`SELECT id FROM events WHERE uid = '' OR uid IS NULL`);
     const ids: number[] = [];
@@ -658,6 +697,71 @@ export class Db {
     }
     rows.close();
     return out;
+  }
+
+  // ---------------------------------------------------------------- 文献库
+  static async paperAdd(title: string, authors: string, year: string, url: string,
+    summary: string): Promise<number> {
+    const existed = await Db.need().querySql('SELECT id FROM papers WHERE url = ? LIMIT 1', [url]);
+    let id = 0;
+    if (existed.goToFirstRow()) {
+      id = existed.getLong(0);
+    }
+    existed.close();
+    if (id > 0) {
+      return id;
+    }
+    const bucket: relationalStore.ValuesBucket = {
+      title: title,
+      authors: authors,
+      year: year,
+      url: url,
+      summary: summary,
+      note: '',
+      stars: 0,
+      color: '',
+      file_path: '',
+      created_at: Db.stamp(),
+      updated_at: Db.isoNow(),
+    };
+    return await Db.need().insert('papers', bucket);
+  }
+
+  static async paperList(): Promise<PaperRow[]> {
+    const rows = await Db.need().querySql(
+      'SELECT id, title, authors, year, url, summary, note, stars, color, file_path FROM papers ORDER BY id DESC');
+    const out: PaperRow[] = [];
+    while (rows.goToNextRow()) {
+      out.push({
+        id: rows.getLong(0),
+        title: rows.getString(1),
+        authors: rows.getString(2),
+        year: rows.getString(3),
+        url: rows.getString(4),
+        summary: rows.getString(5),
+        note: rows.getString(6),
+        stars: rows.getLong(7),
+        color: rows.getString(8),
+        filePath: rows.getString(9),
+      });
+    }
+    rows.close();
+    return out;
+  }
+
+  static async paperUpdate(id: number, note: string, stars: number, color: string): Promise<void> {
+    await Db.need().executeSql(
+      'UPDATE papers SET note = ?, stars = ?, color = ?, updated_at = ? WHERE id = ?',
+      [note, stars, color, Db.isoNow(), id]);
+  }
+
+  static async paperSetFile(id: number, path: string): Promise<void> {
+    await Db.need().executeSql('UPDATE papers SET file_path = ?, updated_at = ? WHERE id = ?',
+      [path, Db.isoNow(), id]);
+  }
+
+  static async paperDelete(id: number): Promise<void> {
+    await Db.need().executeSql('DELETE FROM papers WHERE id = ?', [id]);
   }
 
   static async countFast(sql: string): Promise<number> {

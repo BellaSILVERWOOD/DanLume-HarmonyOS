@@ -1,15 +1,17 @@
-import { Db, EventRow, ChatSessionRow, MemoryRow } from '../common/Db';
-import { Api, PaperHit, AiProfile } from '../common/Api';
-import { importSystemCalendar, importDlpk, exportDayToSystem } from '../common/Migrate';
+import { Db, EventRow, ChatSessionRow, MemoryRow, PaperRow } from '../common/Db';
+import { Api, PaperHit, AiProfile, ChatTurn } from '../common/Api';
+import { importSystemCalendar, importDlpk, exportDayToSystem, importIcsFile } from '../common/Migrate';
 import { PHONE_TOOL_NAMES, TOOL_LABELS, toolKey } from '../common/AiTools';
-import { sendMail, fetchInbox, fetchInboxList, fetchMailBody, MailHeader } from '../common/Mail';
+import { sendMail, fetchInbox, fetchInboxList, fetchMailList, fetchMailBody, MailHeader } from '../common/Mail';
 import { syncEvents } from '../common/Sync';
 import { parseMarkdown, MdBlock, MdKind, MdSpan } from '../common/Md';
 import common from '@ohos.app.ability.common';
 import reminderAgentManager from '@ohos.reminderAgentManager';
 import notificationManager from '@ohos.notificationManager';
 import { speechRecognizer } from '@kit.CoreSpeechKit';
-import { picker, fileIo as fsKit } from '@kit.CoreFileKit';
+import { picker, fileIo as fsKit, fileUri } from '@kit.CoreFileKit';
+import { photoAccessHelper } from '@kit.MediaLibraryKit';
+import { camera, cameraPicker } from '@kit.CameraKit';
 import abilityAccessCtrl, { Permissions } from '@ohos.abilityAccessCtrl';
 import pasteboard from '@ohos.pasteboard';
 import { promptAction } from '@kit.ArkUI';
@@ -17,6 +19,8 @@ import { promptAction } from '@kit.ArkUI';
 interface ChatLine {
   role: 'user' | 'assistant';
   text: string;
+  /** 推理模型给的思考过程（可能为空） */
+  reasoning?: string;
 }
 
 /** 今日列表的一项（ArkTS 不允许对象字面量当类型，ForEach 回调也要写类型） */
@@ -90,6 +94,12 @@ struct Index {
   @State mailBody: string = '';
   @State inboxList: MailHeader[] = [];
   @State inboxDetail: string = '';
+  // 首页邮箱页
+  @State mailOpen: boolean = false;
+  @State mailKind: string = 'INBOX';
+  @State mailList: MailHeader[] = [];
+  @State mailDetail: string = '';
+  @State mailLoading: boolean = false;
   @State syncing: boolean = false;
   // 小工具：备忘 / 倒计时 / 闪卡 / 番茄钟
   @State memos: string[] = [];
@@ -106,6 +116,7 @@ struct Index {
   pomoTimer: number = -1;
   // AI 历史会话 / 记忆
   @State drawer: string = 'none';
+  @State settingsPage: string = '';
   @State sessions: ChatSessionRow[] = [];
   @State memories: MemoryRow[] = [];
   @State chatSessionId: number = 0;
@@ -145,9 +156,19 @@ struct Index {
   @State paperQuery: string = '';
   @State papers: PaperHit[] = [];
   @State paperBusy: boolean = false;
+  @State paperOffset: number = 0;
+  @State paperHasMore: boolean = true;
+  @State paperSel: number = -1;
+  // 我的文献库
+  @State library: PaperRow[] = [];
+  @State paperEditId: number = 0;
+  @State paperNote: string = '';
+  @State paperStars: number = 0;
+  @State paperColor: string = '';
   @State listening: boolean = false;
   // 语音识别引擎（第一次用时创建，之后复用）
   asrEngine: speechRecognizer.SpeechRecognitionEngine | null = null;
+  lastStreamAt: number = 0;
 
   /** 每晚 18:00 之后第一次打开 App，自动把当天对话整理成记忆（一天只跑一次） */
   async maybeOrganizeMemories(): Promise<void> {
@@ -178,6 +199,7 @@ struct Index {
     this.reloadAi();
     this.reloadMail();
     this.reloadTools();
+    this.reloadLibrary();
     void this.maybeOrganizeMemories();
     if (this.month.length === 0) {
       this.month = this.today.slice(0, 7);
@@ -549,13 +571,43 @@ struct Index {
     } catch (err) {
       this.message = `导入系统日历失败：${err}`;
     }
-    try {
-      promptAction.showToast({ message: this.message, duration: 3500 });
-    } catch (e) {
-      // 忽略
-    }
+    // 导入结果用对话框显示（多行诊断信息，toast 看不全）
+    AlertDialog.show({
+      title: '导入手机日历',
+      message: this.message,
+      confirm: {
+        value: '知道了',
+        action: () => {
+          // 什么都不做
+        },
+      },
+    });
     await this.reloadToday();
     await this.reloadMonth();
+    await this.reloadDay();
+  }
+
+  /** 导入 .ics（系统日历账户读不出来时的兜底） */
+  async importIcs(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      this.message = await importIcsFile(context);
+    } catch (err) {
+      this.message = `导入 .ics 失败：${err}`;
+    }
+    AlertDialog.show({
+      title: '导入 .ics',
+      message: this.message,
+      confirm: {
+        value: '知道了',
+        action: () => {
+          // 什么都不做
+        },
+      },
+    });
+    await this.reloadToday();
+    await this.reloadMonth();
+    await this.reloadDay();
   }
 
   /** 把选中那天的日程写进系统日历 */
@@ -804,6 +856,47 @@ struct Index {
       this.message = `发送失败：${err}`;
     }
     this.mailBusy = false;
+    AlertDialog.show({
+      title: '发测试邮件',
+      message: this.message,
+      confirm: {
+        value: '知道了',
+        action: () => {
+          // 什么都不做
+        },
+      },
+    });
+  }
+
+  // ------------------------------------------------------------ 首页邮箱页
+  async openMailbox(): Promise<void> {
+    this.mailOpen = true;
+    await this.loadMailbox('INBOX');
+  }
+
+  async loadMailbox(kind: string): Promise<void> {
+    this.mailKind = kind;
+    this.mailDetail = '';
+    this.mailLoading = true;
+    try {
+      this.mailList = await fetchMailList(kind, 10);
+      this.message = this.mailList.length > 0
+        ? `${kind === 'SENT' ? '发件箱' : '收件箱'} ${this.mailList.length} 封`
+        : '这个文件夹是空的';
+    } catch (err) {
+      this.message = `读邮件失败：${err instanceof Error ? err.message : err}`;
+    }
+    this.mailLoading = false;
+  }
+
+  async openMailBody(item: MailHeader): Promise<void> {
+    this.mailLoading = true;
+    try {
+      this.mailDetail = await fetchMailBody(item.index, this.mailKind);
+    } catch (err) {
+      this.message = `读正文失败：${err instanceof Error ? err.message : err}`;
+    }
+    this.mailLoading = false;
   }
 
   async previewInbox(): Promise<void> {
@@ -855,6 +948,16 @@ struct Index {
       this.message = `发送失败：${err instanceof Error ? err.message : err}`;
     }
     this.mailBusy = false;
+    AlertDialog.show({
+      title: '发送邮件',
+      message: this.message,
+      confirm: {
+        value: '知道了',
+        action: () => {
+          // 什么都不做
+        },
+      },
+    });
   }
 
   /** 点列表里的一行：把它填进下面的编辑框 */
@@ -1146,6 +1249,15 @@ struct Index {
     await this.reloadToday();
   }
 
+  /** 当前对话转成「用户/助手」成对的 turns（只发纯问题会让模型从头答最早那题） */
+  chatTurns(): ChatTurn[] {
+    const turns: ChatTurn[] = [];
+    for (const line of this.chat) {
+      turns.push(new ChatTurn(line.role, line.text));
+    }
+    return turns;
+  }
+
   async askMeizi(): Promise<void> {
     const text = this.chatDraft.trim();
     if (text.length === 0 || this.asking) {
@@ -1153,12 +1265,7 @@ struct Index {
     }
     this.asking = true;
     this.message = '';
-    const history: string[] = [];
-    for (const line of this.chat) {
-      if (line.role === 'user') {
-        history.push(line.text);
-      }
-    }
+    const turns = this.chatTurns();
     this.chat.push({ role: 'user', text: text });
     this.chatDraft = '';
     if (this.chatSessionId === 0) {
@@ -1166,15 +1273,38 @@ struct Index {
         text.length > 20 ? `${text.substring(0, 20)}…` : text);
     }
     await Db.chatMessageAdd(this.chatSessionId, 'user', text);
+    this.chat.push({ role: 'assistant', text: '', reasoning: '' });
+    const answerIndex = this.chat.length - 1;
+    this.lastStreamAt = 0;
     try {
-      const answer = await Api.chat(text, history);
-      this.chat.push({ role: 'assistant', text: answer });
+      const answer = await Api.chatStreaming(text, turns, (partial: string, reasoning: string) => {
+        this.updateAssistant(answerIndex, partial, reasoning, false);
+      });
+      this.updateAssistant(answerIndex, answer, this.chat[answerIndex].reasoning ?? '', true);
       await Db.chatMessageAdd(this.chatSessionId, 'assistant', answer);
     } catch (err) {
-      this.chat.push({ role: 'assistant', text: `出错了：${err}` });
+      this.updateAssistant(answerIndex, `出错了：${err}`, '', true);
     } finally {
       this.asking = false;
     }
+  }
+
+  /** 流式更新时重建数组（ArkUI 只有换引用才会刷新），80ms 节流一次 */
+  updateAssistant(index: number, text: string, reasoning: string, force: boolean): void {
+    const now = Date.now();
+    if (!force && now - this.lastStreamAt < 80) {
+      return;
+    }
+    this.lastStreamAt = now;
+    const lines: ChatLine[] = [];
+    for (let i = 0; i < this.chat.length; i += 1) {
+      if (i === index) {
+        lines.push({ role: 'assistant', text: text, reasoning: reasoning });
+      } else {
+        lines.push(this.chat[i]);
+      }
+    }
+    this.chat = lines;
   }
 
   async doLogin(): Promise<void> {
@@ -1239,7 +1369,10 @@ struct Index {
     this.paperBusy = true;
     this.message = '正在检索 arXiv…';
     try {
-      this.papers = await Api.arxivSearch(query, 8);
+      this.papers = await Api.arxivSearch(query, 10, 0);
+      this.paperOffset = this.papers.length;
+      this.paperHasMore = this.papers.length >= 10;
+      this.paperSel = -1;
       this.message = this.papers.length > 0
         ? `找到 ${this.papers.length} 篇`
         : '没找到结果（换英文关键词试试）';
@@ -1248,6 +1381,196 @@ struct Index {
     } finally {
       this.paperBusy = false;
     }
+  }
+
+  /** 滚到底部加载下一页 */
+  async loadMorePapers(): Promise<void> {
+    if (this.paperBusy || !this.paperHasMore) {
+      return;
+    }
+    const query = this.paperQuery.trim();
+    if (query.length === 0) {
+      return;
+    }
+    this.paperBusy = true;
+    try {
+      const more = await Api.arxivSearch(query, 10, this.paperOffset);
+      if (more.length === 0) {
+        this.paperHasMore = false;
+      } else {
+        const merged: PaperHit[] = [];
+        for (const item of this.papers) {
+          merged.push(item);
+        }
+        for (const item of more) {
+          merged.push(item);
+        }
+        this.papers = merged;
+        this.paperOffset += more.length;
+        this.paperHasMore = more.length >= 10;
+      }
+      this.message = `已加载 ${this.papers.length} 篇`;
+    } catch (err) {
+      this.message = `加载更多失败：${err}`;
+    } finally {
+      this.paperBusy = false;
+    }
+  }
+
+  selectedPaper(): PaperHit | null {
+    if (this.paperSel < 0 || this.paperSel >= this.papers.length) {
+      return null;
+    }
+    return this.papers[this.paperSel];
+  }
+
+  async paperSummaryAction(): Promise<void> {
+    const paper = this.selectedPaper();
+    if (paper === null) {
+      return;
+    }
+    this.message = '正在生成概要…';
+    try {
+      const text = await Api.paperSummary(paper.title, paper.summary);
+      AlertDialog.show({
+        title: '概要',
+        message: text,
+        confirm: { value: '知道了', action: () => { } },
+      });
+      this.message = '概要已生成';
+    } catch (err) {
+      this.message = `概要失败：${err instanceof Error ? err.message : err}`;
+    }
+  }
+
+  async paperFlowAction(): Promise<void> {
+    const paper = this.selectedPaper();
+    if (paper === null) {
+      return;
+    }
+    this.message = '正在整理流程图…';
+    try {
+      const text = await Api.paperFlowchart(paper.title, paper.summary);
+      AlertDialog.show({
+        title: '方法流程',
+        message: text,
+        confirm: { value: '知道了', action: () => { } },
+      });
+      this.message = '流程图已生成';
+    } catch (err) {
+      this.message = `流程图失败：${err instanceof Error ? err.message : err}`;
+    }
+  }
+
+  async paperDownloadAction(): Promise<void> {
+    const paper = this.selectedPaper();
+    if (paper === null) {
+      return;
+    }
+    this.message = '正在下载 PDF…';
+    const name = `paper_${Date.now()}.pdf`;
+    const path = await Api.downloadPaperUrl(paper.url, name);
+    this.message = path.length > 0 ? `已下载到 ${path}` : '下载失败（链接可能不是 PDF）';
+  }
+
+  async paperAddAction(): Promise<void> {
+    const paper = this.selectedPaper();
+    if (paper === null) {
+      return;
+    }
+    const id = await Db.paperAdd(paper.title, paper.authors, paper.year, paper.url, paper.summary);
+    this.message = `已加入文献库（id=${id}）`;
+    await this.reloadLibrary();
+  }
+
+  async reloadLibrary(): Promise<void> {
+    this.library = await Db.paperList();
+  }
+
+  openPaperEdit(item: PaperRow): void {
+    this.paperEditId = item.id;
+    this.paperNote = item.note;
+    this.paperStars = item.stars;
+    this.paperColor = item.color;
+  }
+
+  async savePaperEdit(): Promise<void> {
+    if (this.paperEditId === 0) {
+      return;
+    }
+    await Db.paperUpdate(this.paperEditId, this.paperNote, this.paperStars, this.paperColor);
+    this.paperEditId = 0;
+    this.message = '文献已保存';
+    await this.reloadLibrary();
+  }
+
+  askAiAboutPaper(item: PaperRow): void {
+    this.chatDraft = `请帮我读一下这篇论文，并回答我的问题：\n标题：${item.title}\n作者：${item.authors}\n链接：${item.url}\n摘要：${item.summary}\n\n（我的问题：）`;
+    this.chat = [];
+    this.chatSessionId = 0;
+    this.currentTab = 3;
+    this.message = '已放到梅子输入框';
+  }
+
+  paperColors(): string[] {
+    return ['', '#c8546a', '#3f9e6a', '#3b82f6', '#f59e0b'];
+  }
+
+  async setPaperStars(item: PaperRow, stars: number): Promise<void> {
+    await Db.paperUpdate(item.id, item.note, stars, item.color);
+    await this.reloadLibrary();
+  }
+
+  async downloadLibraryPaper(item: PaperRow): Promise<void> {
+    if (item.filePath.length > 0) {
+      this.openPdf(item.filePath);
+      return;
+    }
+    this.message = '正在下载 PDF…';
+    const path = await Api.downloadPaperUrl(item.url, `paper_${item.id}.pdf`);
+    if (path.length > 0) {
+      await Db.paperSetFile(item.id, path);
+      this.message = `已下载到 ${path}`;
+      await this.reloadLibrary();
+    } else {
+      this.message = '下载失败（链接可能不是 PDF）';
+    }
+  }
+
+  /** 用系统 PDF 查看器打开沙箱里的文件 */
+  openPdf(path: string): void {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const uri = fileUri.getUriFromPath(path);
+      context.startAbility({
+        action: 'ohos.want.action.viewData',
+        uri: uri,
+        type: 'application/pdf',
+      }).catch((err: Error) => {
+        this.message = `打不开 PDF：${err.message}`;
+      });
+    } catch (err) {
+      this.message = `打不开 PDF：${err}`;
+    }
+  }
+
+  deletePaper(id: number): void {
+    AlertDialog.show({
+      title: '删除文献',
+      message: '确认从文献库删除这篇吗？',
+      primaryButton: { value: '取消', action: () => { } },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#c8546a',
+        action: () => { void this.doDeletePaper(id); },
+      },
+    });
+  }
+
+  async doDeletePaper(id: number): Promise<void> {
+    await Db.paperDelete(id);
+    await this.reloadLibrary();
+    this.message = '已删除';
   }
 
   /** 用系统浏览器打开 PDF / 原文（不需要额外权限） */
@@ -1425,6 +1748,85 @@ struct Index {
     this.message = '记忆已删除';
   }
 
+  /** 附件菜单：上传文件 / 选择图片 / 拍照 */
+  @Builder
+  attachMenu() {
+    Column({ space: 2 }) {
+      Row() {
+        Text('上传文件（读文本）').fontSize(13).fontColor('#1f2328')
+      }
+      .width(160)
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .borderRadius(8)
+      .onClick(() => { void this.pickAttachment(); })
+      Row() {
+        Text('选择图片').fontSize(13).fontColor('#1f2328')
+      }
+      .width(160)
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .borderRadius(8)
+      .onClick(() => { void this.attachPhoto(); })
+      Row() {
+        Text('拍照').fontSize(13).fontColor('#1f2328')
+      }
+      .width(160)
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .borderRadius(8)
+      .onClick(() => { void this.takePhoto(); })
+    }
+    .width(160)
+    .padding(6)
+    .borderRadius(12)
+    .backgroundColor(Color.White)
+    .shadow({ radius: 16, color: '#1F2A2A40', offsetY: 6 })
+  }
+
+  /** 选一张图片（相册） */
+  async attachPhoto(): Promise<void> {
+    try {
+      const opts = new photoAccessHelper.PhotoSelectOptions();
+      opts.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
+      opts.maxSelectNumber = 1;
+      const photoPicker = new photoAccessHelper.PhotoViewPicker();
+      const res = await photoPicker.select(opts);
+      if (res.photoUris.length === 0) {
+        return;
+      }
+      await this.saveImage(res.photoUris[0]);
+    } catch (err) {
+      this.message = `选择图片失败：${err}`;
+    }
+  }
+
+  /** 调系统相机拍一张 */
+  async takePhoto(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const res = await cameraPicker.pick(context, [cameraPicker.PickerMediaType.PHOTO], {
+        cameraPosition: camera.CameraPosition.CAMERA_POSITION_BACK,
+      });
+      if (res.resultUri === undefined || res.resultUri.length === 0) {
+        return;
+      }
+      await this.saveImage(res.resultUri);
+    } catch (err) {
+      this.message = `拍照失败：${err}`;
+    }
+  }
+
+  /** 图片先落到应用目录，再把路径塞进输入框（接口暂不支持读图） */
+  async saveImage(uri: string): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    const parts = uri.split('/');
+    const name = parts.length > 0 ? parts[parts.length - 1] : `image_${Date.now()}.jpg`;
+    const src = fsKit.openSync(uri, fsKit.OpenMode.READ_ONLY);
+    const dest = `${context.filesDir}/${name}`;
+    fsKit.copyFileSync(src.fd, dest);
+    fsKit.closeSync(src);
+    this.chatDraft = `【图片 ${name} 已存到 ${dest}】\n`;
+    this.message = '图片已保存到应用目录（当前接口不支持直接读图，可以让我用 fs_read 读文本）';
+  }
+
   copyText(text: string): void {
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
     pasteboard.getSystemPasteboard().setData(data).then(() => {
@@ -1467,21 +1869,21 @@ struct Index {
     } catch (e) {
       // 忽略
     }
-    const history: string[] = [];
-    for (const line of this.chat) {
-      if (line.role === 'user') {
-        history.push(line.text);
-      }
-    }
+    const turns = this.chatTurns();
     this.asking = true;
+    this.chat.push({ role: 'assistant', text: '', reasoning: '' });
+    const answerIndex = this.chat.length - 1;
+    this.lastStreamAt = 0;
     try {
-      const answer = await Api.chat(lastUser, history);
-      this.chat.push({ role: 'assistant', text: answer });
+      const answer = await Api.chatStreaming(lastUser, turns, (partial: string, reasoning: string) => {
+        this.updateAssistant(answerIndex, partial, reasoning, false);
+      });
+      this.updateAssistant(answerIndex, answer, this.chat[answerIndex].reasoning ?? '', true);
       if (this.chatSessionId > 0) {
         await Db.chatMessageAdd(this.chatSessionId, 'assistant', answer);
       }
     } catch (err) {
-      this.chat.push({ role: 'assistant', text: `出错了：${err}` });
+      this.updateAssistant(answerIndex, `出错了：${err}`, '', true);
     } finally {
       this.asking = false;
     }
@@ -1596,6 +1998,13 @@ struct Index {
   todayTab() {
     Column({ space: 12 }) {
       Row({ space: 8 }) {
+        Text('✉')
+          .fontSize(20)
+          .fontColor('#1f2328')
+          .width(34)
+          .height(34)
+          .textAlign(TextAlign.Center)
+          .onClick(() => { void this.openMailbox(); })
         Text(this.today).fontSize(13).fontColor('#8a8f98').layoutWeight(1)
         Button('今天')
           .height(28)
@@ -2111,6 +2520,91 @@ struct Index {
   }
 
   @Builder
+  mailTab(label: string, kind: string) {
+    Text(label)
+      .fontSize(13)
+      .fontColor(this.mailKind === kind ? '#FFFFFF' : '#1f2328')
+      .layoutWeight(1)
+      .height(34)
+      .textAlign(TextAlign.Center)
+      .borderRadius(10)
+      .backgroundColor(this.mailKind === kind ? '#c8546a' : '#F2F2F4')
+      .onClick(() => { void this.loadMailbox(kind); })
+  }
+
+  @Builder
+  mailPage() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        Text('‹')
+          .fontSize(22)
+          .fontColor('#1f2328')
+          .width(32)
+          .textAlign(TextAlign.Center)
+          .onClick(() => { this.mailOpen = false; })
+        Text('邮箱').fontSize(18).fontWeight(600).fontColor('#1f2328').layoutWeight(1)
+        Text(this.mailLoading ? '…' : '刷新')
+          .fontSize(13)
+          .fontColor('#c8546a')
+          .onClick(() => { void this.loadMailbox(this.mailKind); })
+      }
+      .width('100%')
+
+      Row({ space: 8 }) {
+        this.mailTab('收件箱', 'INBOX')
+        this.mailTab('发件箱', 'SENT')
+      }
+      .width('100%')
+
+      if (this.message.length > 0) {
+        Text(this.message).fontSize(12).fontColor('#c8546a').width('100%')
+      }
+
+      List({ space: 6 }) {
+        ForEach(this.mailList, (item: MailHeader) => {
+          ListItem() {
+            Column({ space: 2 }) {
+              Text(item.subject.length > 0 ? item.subject : '（无主题）')
+                .fontSize(14)
+                .fontColor('#1f2328')
+                .maxLines(1)
+                .width('100%')
+              Text(this.mailKind === 'SENT' ? `发给：${item.to}` : item.from)
+                .fontSize(11)
+                .fontColor('#9a9aa2')
+                .maxLines(1)
+                .width('100%')
+              Text(item.date).fontSize(10).fontColor('#b9bcc4').width('100%')
+            }
+            .width('100%')
+            .padding(10)
+            .borderRadius(10)
+            .backgroundColor('#F7F7FA')
+            .onClick(() => { void this.openMailBody(item); })
+          }
+        }, (item: MailHeader) => `${this.mailKind}-${item.index}`)
+      }
+      .layoutWeight(1)
+      .width('100%')
+
+      if (this.mailDetail.length > 0) {
+        Scroll() {
+          Text(this.mailDetail).fontSize(12).fontColor('#3a3a40').width('100%')
+        }
+        .height(220)
+        .width('100%')
+        .padding(10)
+        .borderRadius(10)
+        .backgroundColor('#F4F4F7')
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+    .backgroundColor(Color.White)
+  }
+
+  @Builder
   chatTab() {
     // 列表在底层、输入框浮在上面：文字从半透明输入框底下滚过去，才不会出现「纯色块盖住文字」
     Stack({ alignContent: Alignment.Bottom }) {
@@ -2175,7 +2669,22 @@ struct Index {
                         .backgroundColor('#F1F1F3')
                         .constraintSize({ maxWidth: '84%' })
                     } else {
-                      Column() {
+                      Column({ space: 6 }) {
+                        if ((line.reasoning ?? '').length > 0) {
+                          Column({ space: 4 }) {
+                            Text('思考过程').fontSize(10).fontColor('#9a9aa2').width('100%')
+                            Text(line.reasoning)
+                              .fontSize(12)
+                              .fontColor('#8a8f98')
+                              .maxLines(10)
+                              .textOverflow({ overflow: TextOverflow.Ellipsis })
+                              .width('100%')
+                          }
+                          .width('100%')
+                          .padding(10)
+                          .borderRadius(12)
+                          .backgroundColor('#F4F4F7')
+                        }
                         this.mdView(line.text)
                       }
                       .width('100%')
@@ -2237,7 +2746,7 @@ struct Index {
               .width(38)
               .height(38)
               .textAlign(TextAlign.Center)
-              .onClick(() => { void this.pickAttachment(); })
+              .bindMenu(this.attachMenu)
             TextInput({ text: this.chatDraft, placeholder: 'Ask 梅子…' })
               .layoutWeight(1)
               .height(44)
@@ -2281,6 +2790,150 @@ struct Index {
   }
 
   @Builder
+  papersPage() {
+    Column({ space: 10 }) {
+    if (this.message.length > 0) {
+      Text(this.message).fontSize(12).fontColor('#c8546a').width('100%')
+    }
+    if (this.library.length === 0) {
+      Text('还没有文献：去「文献」页选中一篇 → 加入文献库')
+        .fontSize(12)
+        .fontColor('#9a9aa2')
+        .width('100%')
+    }
+    ForEach(this.library, (item: PaperRow) => {
+      Column({ space: 6 }) {
+        Row({ space: 6 }) {
+          Column({ space: 2 }) {
+            Text(item.title).fontSize(14).fontColor('#1f2328').maxLines(2).width('100%')
+            Text(`${item.year} · ${item.authors}`)
+              .fontSize(11)
+              .fontColor('#9a9aa2')
+              .maxLines(1)
+              .width('100%')
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+          if (item.color.length > 0) {
+            Circle().width(10).height(10).fill(item.color)
+          }
+        }
+        .width('100%')
+        .onClick(() => { this.openPaperEdit(item); })
+
+        Row({ space: 4 }) {
+          ForEach([1, 2, 3, 4, 5], (n: number) => {
+            Text(n <= item.stars ? '★' : '☆')
+              .fontSize(16)
+              .fontColor(n <= item.stars ? '#f59e0b' : '#C7C9CE')
+              .onClick(() => { void this.setPaperStars(item, n); })
+          }, (n: number) => `${item.id}-${n}`)
+          Text(item.filePath.length > 0 ? '查看 PDF' : '下载').fontSize(11).fontColor('#5c6270').padding(4)
+            .onClick(() => { void this.downloadLibraryPaper(item); })
+          Text('问 AI').fontSize(11).fontColor('#c8546a').padding(4)
+            .onClick(() => { this.askAiAboutPaper(item); })
+          Text('删除').fontSize(11).fontColor('#c8546a').padding(4)
+            .onClick(() => { this.deletePaper(item.id); })
+        }
+        .width('100%')
+
+        if (this.paperEditId === item.id) {
+          Column({ space: 6 }) {
+            Row({ space: 6 }) {
+              ForEach(this.paperColors(), (color: string) => {
+                Circle()
+                  .width(18)
+                  .height(18)
+                  .fill(color.length > 0 ? color : '#E5E5EA')
+                  .border({ width: this.paperColor === color ? 2 : 0, color: '#1f2328' })
+                  .onClick(() => { this.paperColor = color; })
+              }, (color: string) => `${item.id}-${color}`)
+            }
+            .width('100%')
+            TextArea({ text: this.paperNote, placeholder: '笔记' })
+              .height(80)
+              .width('100%')
+              .fontSize(12)
+              .onChange((v: string) => { this.paperNote = v; })
+            Row({ space: 8 }) {
+              Button('保存')
+                .layoutWeight(1)
+                .height(32)
+                .fontSize(12)
+                .backgroundColor('#c8546a')
+                .onClick(() => { void this.savePaperEdit(); })
+              Button('取消')
+                .layoutWeight(1)
+                .height(32)
+                .fontSize(12)
+                .backgroundColor('#F2F2F4')
+                .fontColor('#2b2f36')
+                .onClick(() => { this.paperEditId = 0; })
+            }
+            .width('100%')
+          }
+          .width('100%')
+        }
+      }
+      .width('100%')
+      .padding(10)
+      .borderRadius(12)
+      .backgroundColor('#F7F7FA')
+    }, (item: PaperRow) =>
+      `${item.id}-${item.stars}-${item.color}-${item.filePath}-${this.paperEditId === item.id ? 1 : 0}`)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  settingsRow(title: string, sub: string, key: string) {
+    Row({ space: 10 }) {
+      Column({ space: 3 }) {
+        Text(title)
+          .fontSize(15)
+          .fontWeight(500)
+          .fontColor('#1f2328')
+          .width('100%')
+        Text(sub)
+          .fontSize(11)
+          .fontColor('#9a9aa2')
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+      }
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
+      Text('›').fontSize(18).fontColor('#C7C9CE')
+    }
+    .width('100%')
+    .padding(14)
+    .borderRadius(14)
+    .backgroundColor(Color.White)
+    .onClick(() => {
+      this.settingsPage = key;
+      if (key === 'papers') {
+        void this.reloadLibrary();
+      }
+    })
+  }
+
+  @Builder
+  settingsHeader(title: string) {
+    Row({ space: 8 }) {
+      Text('‹')
+        .fontSize(22)
+        .fontColor('#1f2328')
+        .width(32)
+        .textAlign(TextAlign.Center)
+        .onClick(() => { this.settingsPage = ''; })
+      Text(title).fontSize(18).fontWeight(600).fontColor('#1f2328').layoutWeight(1)
+    }
+    .width('100%')
+    .padding({ bottom: 4 })
+  }
+
+  @Builder
   meTab() {
     // 设置页内容很长：必须包一层 Scroll，否则下面的「保存这组接口 / 邮件 / 小工具」点不到
     Scroll() {
@@ -2288,6 +2941,26 @@ struct Index {
       if (this.message.length > 0) {
         Text(this.message).fontSize(12).fontColor('#c8546a').width('100%')
       }
+
+      if (this.settingsPage === '') {
+        Text('设置').fontSize(24).fontWeight(700).fontColor('#1f2328').width('100%')
+        this.settingsRow('账号', this.accountName.length > 0 ? `已登录：${this.accountName}` : '还没登录账号', 'account')
+        this.settingsRow('AI 接口', `${this.aiProfiles.length} 组配置`, 'ai')
+        this.settingsRow('AI 工具权限', this.aiToolsOn ? '已开启' : '已关闭', 'tools')
+        this.settingsRow('邮件', this.mailAddress.length > 0 ? this.mailAddress : '未配置', 'mail')
+        this.settingsRow('小工具', '备忘 / 倒计时 / 闪卡', 'mini')
+        this.settingsRow('我的文献库', this.library.length > 0 ? `${this.library.length} 篇` : '还没有收藏', 'papers')
+        this.settingsRow('服务器与同步', this.serverUrl, 'sync')
+        this.settingsRow('公告', this.notices.length > 0 ? `${this.notices.length} 条` : '点进去拉取', 'notice')
+      }
+
+      if (this.settingsPage === 'papers') {
+        this.settingsHeader('我的文献库')
+        this.papersPage()
+      }
+
+      if (this.settingsPage === 'account') {
+        this.settingsHeader('账号')
       Text(this.accountName.length > 0 ? `已登录：${this.accountName}` : '还没登录账号')
         .fontSize(14)
         .width('100%')
@@ -2314,13 +2987,20 @@ struct Index {
           .onClick(() => { void this.doLogin(); })
       }
       .width('100%')
+      }
 
+      if (this.settingsPage === 'notice') {
+        this.settingsHeader('公告')
       Button('拉一次公告')
         .height(40)
         .width('100%')
         .backgroundColor('#eeeeee')
         .fontColor('#2b2f36')
         .onClick(() => { void this.pullAnnouncements(); })
+      }
+
+      if (this.settingsPage === 'sync') {
+        this.settingsHeader('服务器与同步')
 
       Button(this.syncing ? '同步中…' : '同步日程到云端')
         .height(40)
@@ -2338,6 +3018,10 @@ struct Index {
         .width('100%')
         .borderRadius(10)
         .onChange((value: string) => { this.serverUrl = value; })
+      }
+
+      if (this.settingsPage === 'ai') {
+        this.settingsHeader('AI 接口')
 
       Text('AI 接口（OpenAI 兼容，可以存多组，聊天页顶部切换）')
         .fontSize(13)
@@ -2415,7 +3099,10 @@ struct Index {
         .fontColor('#2b2f36')
         .onClick(() => { void this.saveAi(); })
 
-      Divider().color('#EFEFF3')
+      }
+
+      if (this.settingsPage === 'tools') {
+        this.settingsHeader('AI 工具权限')
 
       Row({ space: 10 }) {
         Column({ space: 2 }) {
@@ -2452,7 +3139,11 @@ struct Index {
         .backgroundColor('#F7F7FA')
       }
 
-      Divider().color('#EFEFF3')
+      }
+
+      if (this.settingsPage === 'mail') {
+        this.settingsHeader('邮件')
+
       Text('邮件')
         .fontSize(13)
         .fontWeight(500)
@@ -2594,7 +3285,11 @@ struct Index {
         .backgroundColor('#c8546a')
         .onClick(() => { void this.sendCompose(); })
 
-      Divider().color('#EFEFF3')
+      }
+
+      if (this.settingsPage === 'mini') {
+        this.settingsHeader('小工具')
+
       Text('小工具（备忘 / 倒计时 / 闪卡）')
         .fontSize(13)
         .fontWeight(500)
@@ -2688,6 +3383,9 @@ struct Index {
         .alignItems(HorizontalAlign.Start)
       }
 
+      }
+
+      if (this.settingsPage === 'notice') {
       if (this.notices.length > 0) {
         Text('公告')
           .fontSize(13)
@@ -2709,6 +3407,7 @@ struct Index {
           .borderRadius(10)
           .backgroundColor('#F7F7FA')
         }, (notice: NoticeItem) => `${notice.id}`)
+      }
       }
 
       if (this.message.length > 0) {
@@ -2747,38 +3446,72 @@ struct Index {
       }
 
       List({ space: 8 }) {
-        ForEach(this.papers, (paper: PaperHit) => {
+        ForEach(this.papers, (paper: PaperHit, i: number) => {
           ListItem() {
-            Column({ space: 2 }) {
-              Text(paper.title).fontSize(14).width('100%')
-              Text(`${paper.year} · ${paper.authors}`)
-                .fontSize(12)
-                .fontColor('#8a8f98')
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .width('100%')
-              Text(paper.summary)
-                .fontSize(12)
-                .fontColor('#5a5f68')
-                .maxLines(3)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .width('100%')
+            Row({ space: 8 }) {
+              Text(this.paperSel === i ? '●' : '○')
+                .fontSize(18)
+                .fontColor(this.paperSel === i ? '#c8546a' : '#C7C9CE')
+                .width(30)
+                .height(30)
+                .textAlign(TextAlign.Center)
+                .onClick(() => { this.paperSel = this.paperSel === i ? -1 : i; })
+              Column({ space: 2 }) {
+                Text(paper.title).fontSize(14).width('100%')
+                Text(`${paper.year} · ${paper.authors}`)
+                  .fontSize(12)
+                  .fontColor('#8a8f98')
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+                Text(paper.summary)
+                  .fontSize(12)
+                  .fontColor('#5a5f68')
+                  .maxLines(3)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              .onClick(() => { this.openLink(paper.url); })
             }
-            .alignItems(HorizontalAlign.Start)
             .width('100%')
             .padding(10)
             .borderRadius(10)
             .backgroundColor('#F7F7FA')
-            .onClick(() => { this.openLink(paper.url); })
           }
-        }, (paper: PaperHit) => paper.url + paper.title)
+        }, (paper: PaperHit, i: number) => `${paper.url}-${i}`)
       }
       .layoutWeight(1)
       .width('100%')
+      .onReachEnd(() => { void this.loadMorePapers(); })
+
+      if (this.paperSel >= 0) {
+        Row({ space: 8 }) {
+          this.paperAction('概要', () => { void this.paperSummaryAction(); })
+          this.paperAction('流程图', () => { void this.paperFlowAction(); })
+          this.paperAction('下载 PDF', () => { void this.paperDownloadAction(); })
+          this.paperAction('加入文献库', () => { void this.paperAddAction(); })
+        }
+        .width('100%')
+      }
     }
     .padding(16)
     .width('100%')
     .height('100%')
+  }
+
+  @Builder
+  paperAction(label: string, action: () => void) {
+    Text(label)
+      .fontSize(12)
+      .fontColor('#1f2328')
+      .layoutWeight(1)
+      .height(38)
+      .textAlign(TextAlign.Center)
+      .borderRadius(10)
+      .backgroundColor(Color.White)
+      .onClick(action)
   }
 
   /** 新建 / 编辑日程的表单（底部升起的整页，照系统日历那个样式） */
@@ -2954,6 +3687,13 @@ struct Index {
       .padding({ left: 12, right: 12, top: 10, bottom: 10 })
       .borderRadius(8)
       .onClick(() => { void this.importComputer(); })
+      Row() {
+        Text('导入 .ics / .vcs 日历').fontSize(13).fontColor('#1f2328')
+      }
+      .width(180)
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .borderRadius(8)
+      .onClick(() => { void this.importIcs(); })
       Row() {
         Text('导出当天到系统日历').fontSize(13).fontColor('#1f2328')
       }
@@ -3216,6 +3956,10 @@ struct Index {
         }
         .width('100%')
         .height('100%')
+      }
+
+      if (this.mailOpen) {
+        this.mailPage()
       }
     }
     .width('100%')

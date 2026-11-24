@@ -10,7 +10,9 @@
  *   复旦      smtp.fudan.edu.cn:465 / imap.fudan.edu.cn:993（以邮件系统说明为准）
  */
 import socket from '@ohos.net.socket';
+import connection from '@ohos.net.connection';
 import buffer from '@ohos.buffer';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { Db } from './Db';
 
 export class MailConfig {
@@ -39,24 +41,97 @@ export async function loadMailConfig(): Promise<MailConfig> {
   return cfg;
 }
 
+/** 把 BusinessError / 普通错误都转成人能看的字符串（ArkTS 里直接拼对象会变成 [object Object]） */
+function errText(err: Object): string {
+  const o = err as Record<string, Object>;
+  const code = o['code'];
+  const msg = o['message'];
+  const parts: string[] = [];
+  if (code !== undefined && `${code}`.length > 0) {
+    parts.push(`code=${code}`);
+  }
+  if (msg !== undefined && `${msg}`.length > 0) {
+    parts.push(`${msg}`);
+  }
+  return parts.length > 0 ? parts.join(' ') : `${err}`;
+}
+
+/** TLSSocket.connect 只认 IP，不认域名：先自己解析一次 */
+async function resolveHost(host: string): Promise<string> {
+  try {
+    const list = await connection.getAddressesByName(host);
+    if (list.length > 0) {
+      console.info(`[mail] ${host} -> ${list[0].address}`);
+      return list[0].address;
+    }
+  } catch (e) {
+    console.info(`[mail] dns failed: ${errText(e as Object)}`);
+  }
+  return host;
+}
+
+/** 先用 TCPSocket 连上，再升级成 TLSSocket（官方推荐的升级路径） */
+async function upgradeTls(host: string, port: number): Promise<socket.TLSSocket> {
+  const tcp = socket.constructTCPSocketInstance();
+  await tcp.connect({ address: { address: host, port: port }, timeout: 15000 });
+  const tls = socket.constructTLSSocketInstance(tcp);
+  return tls;
+}
+
 class SmtpClient {
   private tls: socket.TLSSocket | null = null;
   private buf: string = '';
   private waiter: ((text: string) => void) | null = null;
+  lastError: string = '';
 
   async connect(host: string, port: number): Promise<void> {
-    const tls = socket.constructTLSSocketInstance();
+    console.info(`[smtp] connect ${host}:${port}`);
+    let tls: socket.TLSSocket;
+    try {
+      tls = await upgradeTls(host, port);
+      console.info('[smtp] upgraded from TCP');
+      // 升级后有些版本还需要再 connect 一次触发握手；失败了就当已经握好
+      try {
+        await tls.connect({
+          address: { address: host, port: port },
+          secureOptions: {
+            protocols: [socket.Protocol.TLSv12, socket.Protocol.TLSv13],
+            useRemoteCipherPrefer: true,
+          },
+          timeout: 15000,
+        });
+        console.info('[smtp] handshake connect ok');
+      } catch (e3) {
+        console.info(`[smtp] post-upgrade connect: ${errText(e3 as Object)}`);
+      }
+    } catch (e) {
+      console.info(`[smtp] upgrade failed: ${errText(e as Object)}, 走直连兜底`);
+      tls = socket.constructTLSSocketInstance();
+      await resolveHost(host);
+      try {
+        await tls.bind({ address: '0.0.0.0', port: 0, family: 1 });
+      } catch (e2) {
+        console.info(`[smtp] bind skipped: ${errText(e2 as Object)}`);
+      }
+      await tls.connect({
+        address: { address: host, port: port },
+        secureOptions: {
+          protocols: [socket.Protocol.TLSv12, socket.Protocol.TLSv13],
+          useRemoteCipherPrefer: true,
+        },
+        timeout: 15000,
+      });
+    }
     tls.on('message', (info: socket.SocketMessageInfo) => {
+      const size = info.message !== undefined ? info.message.byteLength : -1;
+      console.info(`[smtp] recv ${size} bytes`);
       this.buf += buffer.from(info.message).toString('utf8');
       this.flush();
     });
-    tls.on('error', () => {
+    tls.on('error', (err: BusinessError) => {
+      this.lastError = `${err.code}: ${err.message}`;
+      console.error(`[smtp] socket error ${this.lastError}`);
       this.flush();
-    });
-    await tls.connect({
-      address: { address: host, port: port },
-      secureOptions: {},
-      timeout: 15000,
     });
     this.tls = tls;
   }
@@ -99,13 +174,29 @@ class SmtpClient {
     if (this.tls === null) {
       throw new Error('SMTP 还没连接');
     }
-    await this.tls.send(data);
+    // 统一按 ArrayBuffer 发：字符串发送在真机上会被截断（DATA 正文尤其明显）
+    await this.tls.send(buffer.from(data, 'utf8').buffer);
+  }
+
+  /** 发一段原样数据（DATA 正文），不额外补 CRLF；按 ArrayBuffer 发，避免字符串被截 */
+  async sendData(data: string): Promise<string> {
+    if (this.tls === null) {
+      throw new Error('SMTP 还没连接');
+    }
+    const bytes = buffer.from(data, 'utf8');
+    console.info(`[smtp] >> data ${data.length} chars / ${bytes.length} bytes`);
+    await this.tls.send(bytes.buffer);
+    const resp = await this.waitResponse();
+    console.info(`[smtp] << ${resp.replace(/\r\n/g, ' | ').slice(0, 120)}`);
+    return resp;
   }
 
   /** 发一条命令并等响应；返回响应文本 */
   async cmd(line: string): Promise<string> {
     await this.raw(`${line}\r\n`);
-    return await this.waitResponse();
+    const resp = await this.waitResponse();
+    console.info(`[smtp] << ${resp.replace(/\r\n/g, ' | ').slice(0, 120)}`);
+    return resp;
   }
 
   close(): void {
@@ -122,22 +213,57 @@ function b64(text: string): string {
   return buffer.from(text, 'utf8').toString('base64');
 }
 
-/** 解 =?UTF-8?B?xxx?= 这种 MIME 编码，失败就原样返回 */
+/** Q 编码：先还原成字节数组再按 UTF-8 解（直接 String.fromCharCode 会变成 Latin-1 乱码） */
+function qpDecode(data: string): string {
+  const text = data.replace(/_/g, ' ');
+  const bytes: number[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const c = text.charAt(i);
+    if (c === '=' && i + 2 < text.length) {
+      const code = parseInt(text.substring(i + 1, i + 3), 16);
+      if (!isNaN(code)) {
+        bytes.push(code);
+        i += 3;
+        continue;
+      }
+    }
+    bytes.push(text.charCodeAt(i));
+    i += 1;
+  }
+  return buffer.from(new Uint8Array(bytes)).toString('utf8');
+}
+
+/** 解 =?UTF-8?B?xxx?= / =?utf-8?Q?xxx?= 这种 MIME 编码（可能连续出现多个） */
 function decodeMime(raw: string): string {
-  const m = /=\?UTF-8\?B\?([^?]+)\?=/i.exec(raw);
-  if (m === null) {
-    return raw.trim();
+  const re = /=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g;
+  let out = '';
+  let last = 0;
+  let m = re.exec(raw);
+  while (m !== null) {
+    out += raw.substring(last, m.index);
+    const enc = m[2].toUpperCase();
+    const data = m[3];
+    try {
+      if (enc === 'B') {
+        out += buffer.from(data, 'base64').toString('utf8');
+      } else {
+        out += qpDecode(data);
+      }
+    } catch (e) {
+      out += m[0];
+    }
+    last = m.index + m[0].length;
+    m = re.exec(raw);
   }
-  try {
-    return buffer.from(m[1], 'base64').toString('utf8').trim();
-  } catch (e) {
-    return raw.trim();
-  }
+  out += raw.substring(last);
+  return out.trim();
 }
 
 export class MailHeader {
   index: number = 0;
   from: string = '';
+  to: string = '';
   subject: string = '';
   date: string = '';
 }
@@ -151,15 +277,42 @@ class ImapClient {
   private pattern: RegExp = /^$/;
 
   async connect(host: string, port: number): Promise<void> {
-    const tls = socket.constructTLSSocketInstance();
+    let tls: socket.TLSSocket;
+    try {
+      tls = await upgradeTls(host, port);
+      console.info('[imap] upgraded from TCP');
+      try {
+        await tls.connect({
+          address: { address: host, port: port },
+          secureOptions: {
+            protocols: [socket.Protocol.TLSv12, socket.Protocol.TLSv13],
+            useRemoteCipherPrefer: true,
+          },
+          timeout: 15000,
+        });
+        console.info('[imap] handshake connect ok');
+      } catch (e3) {
+        console.info(`[imap] post-upgrade connect: ${errText(e3 as Object)}`);
+      }
+    } catch (e) {
+      console.info(`[imap] upgrade failed: ${errText(e as Object)}, 走直连兜底`);
+      tls = socket.constructTLSSocketInstance();
+      await resolveHost(host);
+      await tls.bind({ address: '0.0.0.0', port: 0, family: 1 }).catch((e2: Object) => {
+        console.info(`[imap] bind skipped: ${errText(e2)}`);
+      });
+      await tls.connect({
+        address: { address: host, port: port },
+        secureOptions: {
+          protocols: [socket.Protocol.TLSv12, socket.Protocol.TLSv13],
+          useRemoteCipherPrefer: true,
+        },
+        timeout: 15000,
+      });
+    }
     tls.on('message', (info: socket.SocketMessageInfo) => {
       this.buf += buffer.from(info.message).toString('utf8');
       this.pump();
-    });
-    await tls.connect({
-      address: { address: host, port: port },
-      secureOptions: {},
-      timeout: 15000,
     });
     this.tls = tls;
   }
@@ -202,9 +355,10 @@ class ImapClient {
     }
     this.seq += 1;
     this.tag = `a${this.seq}`;
-    const pattern = new RegExp(`\\r\\n${this.tag} (OK|NO|BAD)[^\\r\\n]*\\r\\n`);
+    const pattern = new RegExp(`(?:^|\\r\\n)${this.tag} (OK|NO|BAD)[^\\r\\n]*\\r\\n`);
     const pending = this.waitFor(pattern);
-    await this.tls.send(`${this.tag} ${command}\r\n`);
+    console.info(`[imap] >> ${this.tag} ${command.slice(0, 40)}`);
+    await this.tls.send(buffer.from(`${this.tag} ${command}\r\n`, 'utf8').buffer);
     return await pending;
   }
 
@@ -219,7 +373,34 @@ class ImapClient {
 }
 
 /** 读最近 limit 封邮件的信头；出错抛异常（UI 直接显示 e.message） */
-export async function fetchInboxList(limit: number): Promise<MailHeader[]> {
+/** 找「已发送」文件夹（各家叫法不同，先看 LIST 里的 \Sent 标记） */
+async function resolveFolder(client: ImapClient, kind: string): Promise<string> {
+  if (kind !== 'SENT') {
+    return 'INBOX';
+  }
+  try {
+    const raw = await client.exec('LIST "" "*"');
+    for (const line of raw.split('\r\n')) {
+      if (line.startsWith('* LIST') && line.indexOf('\\Sent') >= 0) {
+        const m = /"([^"]+)"\s*$/.exec(line);
+        if (m !== null) {
+          return m[1];
+        }
+      }
+    }
+    for (const name of ['Sent Messages', 'Sent', 'Sent Items']) {
+      if (raw.indexOf(name) >= 0) {
+        return name;
+      }
+    }
+  } catch (e) {
+    console.info(`[imap] LIST failed: ${errText(e as Object)}`);
+  }
+  return 'Sent';
+}
+
+/** 读某个文件夹最近 limit 封的信头；kind = 'INBOX' | 'SENT' */
+export async function fetchMailList(kind: string, limit: number): Promise<MailHeader[]> {
   const cfg = await loadMailConfig();
   if (cfg.address.length === 0 || cfg.auth.length === 0 || cfg.imapHost.length === 0) {
     throw new Error('还没配置邮箱（我的 → 邮件：地址、授权码、IMAP 服务器）');
@@ -236,7 +417,11 @@ export async function fetchInboxList(limit: number): Promise<MailHeader[]> {
     if (!login.includes(' OK')) {
       throw new Error(`登录失败：${login.slice(0, 120)}（QQ/163 用授权码，不是登录密码）`);
     }
-    const select = await client.exec('SELECT "INBOX"');
+    const folder = await resolveFolder(client, kind);
+    const select = await client.exec(`SELECT "${folder}"`);
+    if (!select.includes(' OK')) {
+      throw new Error(`打不开文件夹 ${folder}`);
+    }
     const existsMatch = /(\d+) EXISTS/.exec(select);
     const total = existsMatch !== null ? parseInt(existsMatch[1], 10) : 0;
     if (total === 0) {
@@ -244,11 +429,15 @@ export async function fetchInboxList(limit: number): Promise<MailHeader[]> {
     }
     const from = Math.max(1, total - n + 1);
     const fetch = await client.exec(
-      `FETCH ${from}:${total} (BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])`);
+      `FETCH ${from}:${total} (BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])`);
     return parseHeaders(fetch, from);
   } finally {
     client.close();
   }
+}
+
+export async function fetchInboxList(limit: number): Promise<MailHeader[]> {
+  return await fetchMailList('INBOX', limit);
 }
 
 /** 读最近 limit 封邮件的信头，拼成给人看的字符串（AI 工具用） */
@@ -269,7 +458,7 @@ export async function fetchInbox(limit: number): Promise<string> {
 }
 
 /** 取第 seq 封的正文（best effort：解 base64 / quoted-printable，HTML 去标签） */
-export async function fetchMailBody(seq: number): Promise<string> {
+export async function fetchMailBody(seq: number, kind: string = 'INBOX'): Promise<string> {
   const cfg = await loadMailConfig();
   if (cfg.address.length === 0 || cfg.auth.length === 0) {
     throw new Error('还没配置邮箱');
@@ -282,7 +471,8 @@ export async function fetchMailBody(seq: number): Promise<string> {
     if (!login.includes(' OK')) {
       throw new Error('IMAP 登录失败（授权码）');
     }
-    await client.exec('SELECT "INBOX"');
+    const folder = await resolveFolder(client, kind);
+    await client.exec(`SELECT "${folder}"`);
     const raw = await client.exec(`FETCH ${seq} BODY.PEEK[]`);
     const message = extractLiteral(raw);
     return decodeMessage(message);
@@ -356,31 +546,44 @@ function decodeMessage(message: string): string {
 
 function parseHeaders(raw: string, firstIndex: number): MailHeader[] {
   const out: MailHeader[] = [];
+  // 先把折行（以空格/制表符开头的续行）拼回去，否则长主题只拿到前一段 encoded-word
+  const folded: string[] = [];
+  for (const line of raw.split('\r\n')) {
+    if ((line.startsWith(' ') || line.startsWith('\t')) && folded.length > 0) {
+      folded[folded.length - 1] += line.trim();
+    } else {
+      folded.push(line);
+    }
+  }
   let index = firstIndex;
   let from = '';
+  let to = '';
   let subject = '';
   let date = '';
-  const lines = raw.split('\r\n');
-  for (const line of lines) {
+  for (const line of folded) {
     if (line.startsWith('* ') && line.includes('FETCH')) {
       if (from.length > 0 || subject.length > 0) {
         const h = new MailHeader();
         h.index = index;
         h.from = from;
+        h.to = to;
         h.subject = subject;
         h.date = date;
         out.push(h);
         index += 1;
       }
       from = '';
+      to = '';
       subject = '';
       date = '';
       continue;
     }
     if (line.startsWith('From:')) {
-      from = line.substring(5).trim();
+      from = decodeMime(line.substring(5).trim());
+    } else if (line.startsWith('To:')) {
+      to = decodeMime(line.substring(3).trim());
     } else if (line.startsWith('Subject:')) {
-      subject = line.substring(8).trim();
+      subject = decodeMime(line.substring(8).trim());
     } else if (line.startsWith('Date:')) {
       date = line.substring(5).trim();
     }
@@ -389,6 +592,7 @@ function parseHeaders(raw: string, firstIndex: number): MailHeader[] {
     const h = new MailHeader();
     h.index = index;
     h.from = from;
+    h.to = to;
     h.subject = subject;
     h.date = date;
     out.push(h);
@@ -456,14 +660,16 @@ export async function sendMail(to: string, subject: string, body: string): Promi
       '',
     ];
     const payload = `${headers.join('\r\n')}${b64(stuffed)}\r\n.\r\n`;
-    resp = await client.cmd(payload);
+    resp = await client.sendData(payload);
     if (!expectCode(resp, '250')) {
       return `发送失败：${resp.slice(0, 120)}`;
     }
     await client.cmd('QUIT');
     return `已发送给 ${to.trim()}`;
   } catch (err) {
-    return `发信出错：${err}`;
+    const extra = client.lastError.length > 0 ? ` / socket ${client.lastError}` : '';
+    const text = err instanceof Error ? err.message : errText(err as Object);
+    return `发信出错：${text}（${cfg.smtpHost}:${cfg.smtpPort}）${extra}`;
   } finally {
     client.close();
   }
