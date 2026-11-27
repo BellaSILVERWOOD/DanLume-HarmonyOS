@@ -67,6 +67,19 @@ export interface PaperRow {
   filePath: string;
 }
 
+/** 备忘（带 id，界面要能删） */
+export interface MemoItem {
+  id: number;
+  body: string;
+}
+
+/** 倒计时（带 id） */
+export interface CountdownItem {
+  id: number;
+  title: string;
+  date: string;
+}
+
 /** 新建日程的入参（ArkTS 不允许把对象字面量直接当类型，必须显式声明） */
 export interface NewEventInput {
   title: string;
@@ -548,6 +561,25 @@ export class Db {
     return out;
   }
 
+  static async memoItems(limit: number): Promise<MemoItem[]> {
+    const predicates = new relationalStore.RdbPredicates('memos');
+    predicates.orderByDesc('id').limitAs(limit);
+    const rows = await Db.need().query(predicates, ['id', 'body']);
+    const out: MemoItem[] = [];
+    while (rows.goToNextRow()) {
+      out.push({
+        id: rows.getLong(rows.getColumnIndex('id')),
+        body: rows.getString(rows.getColumnIndex('body')),
+      });
+    }
+    rows.close();
+    return out;
+  }
+
+  static async memoDelete(id: number): Promise<void> {
+    await Db.need().executeSql('DELETE FROM memos WHERE id = ?', [id]);
+  }
+
   static async flashcardAdd(question: string, answer: string, tag: string): Promise<number> {
     const bucket: relationalStore.ValuesBucket = {
       question: question,
@@ -793,6 +825,26 @@ export class Db {
     }
     rows.close();
     return out;
+  }
+
+  static async countdownItems(limit: number): Promise<CountdownItem[]> {
+    const predicates = new relationalStore.RdbPredicates('countdowns');
+    predicates.orderByAsc('date').limitAs(limit);
+    const rows = await Db.need().query(predicates, ['id', 'title', 'date']);
+    const out: CountdownItem[] = [];
+    while (rows.goToNextRow()) {
+      out.push({
+        id: rows.getLong(rows.getColumnIndex('id')),
+        title: rows.getString(rows.getColumnIndex('title')),
+        date: rows.getString(rows.getColumnIndex('date')),
+      });
+    }
+    rows.close();
+    return out;
+  }
+
+  static async countdownDelete(id: number): Promise<void> {
+    await Db.need().executeSql('DELETE FROM countdowns WHERE id = ?', [id]);
   }
 
   /** 计数类设置（usage_stats 用）：每次 +1 */

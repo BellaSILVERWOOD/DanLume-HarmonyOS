@@ -1,4 +1,4 @@
-import { Db, EventRow, ChatSessionRow, MemoryRow, PaperRow } from '../common/Db';
+import { Db, EventRow, ChatSessionRow, MemoryRow, PaperRow, MemoItem, CountdownItem } from '../common/Db';
 import { Api, PaperHit, AiProfile, ChatTurn } from '../common/Api';
 import { importSystemCalendar, importDlpk, exportDayToSystem, importIcsFile } from '../common/Migrate';
 import { PHONE_TOOL_NAMES, TOOL_LABELS, toolKey } from '../common/AiTools';
@@ -102,9 +102,9 @@ struct Index {
   @State mailLoading: boolean = false;
   @State syncing: boolean = false;
   // 小工具：备忘 / 倒计时 / 闪卡 / 番茄钟
-  @State memos: string[] = [];
+  @State memos: MemoItem[] = [];
   @State memoDraft: string = '';
-  @State countdowns: string[] = [];
+  @State countdowns: CountdownItem[] = [];
   @State cdTitle: string = '';
   @State cdDate: string = '';
   @State flashTotal: number = 0;
@@ -1057,8 +1057,8 @@ struct Index {
 
   // ------------------------------------------------------------ 小工具
   async reloadTools(): Promise<void> {
-    this.memos = await Db.memoSearch('', 8);
-    this.countdowns = await Db.countdownList(8);
+    this.memos = await Db.memoItems(8);
+    this.countdowns = await Db.countdownItems(8);
     this.flashTotal = await Db.countFast('SELECT COUNT(*) FROM flashcards');
   }
 
@@ -1086,6 +1086,44 @@ struct Index {
     this.cdDate = '';
     this.message = '倒计时已加';
     await this.reloadTools();
+  }
+
+  deleteMemo(id: number): void {
+    AlertDialog.show({
+      title: '删除备忘',
+      message: '确认删除这条备忘吗？',
+      primaryButton: { value: '取消', action: () => { } },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#c8546a',
+        action: () => { void this.doDeleteMemo(id); },
+      },
+    });
+  }
+
+  async doDeleteMemo(id: number): Promise<void> {
+    await Db.memoDelete(id);
+    await this.reloadTools();
+    this.message = '备忘已删除';
+  }
+
+  deleteCountdown(id: number): void {
+    AlertDialog.show({
+      title: '删除倒计时',
+      message: '确认删除这个倒计时吗？',
+      primaryButton: { value: '取消', action: () => { } },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#c8546a',
+        action: () => { void this.doDeleteCountdown(id); },
+      },
+    });
+  }
+
+  async doDeleteCountdown(id: number): Promise<void> {
+    await Db.countdownDelete(id);
+    await this.reloadTools();
+    this.message = '倒计时已删除';
   }
 
   async nextFlashcard(): Promise<void> {
@@ -1679,15 +1717,21 @@ struct Index {
     return folder.length > 0 ? folder : '未归档';
   }
 
-  /** 记忆按文件夹分层：遇到新文件夹插一行标题 */
+  /** 记忆按文件夹分层：把 "学业/高数" 拆成两级标题，公共前缀只出现一次 */
   memoryLines(): MemLine[] {
     const out: MemLine[] = [];
-    let last = '';
+    let shown: string[] = [];
     for (const item of this.memories) {
       const folder = this.folderLabel(item.folder);
-      if (folder !== last) {
-        out.push({ kind: 0, title: folder, id: 0, folder: folder });
-        last = folder;
+      const segs: string[] = folder.split('/');
+      let common = 0;
+      while (common < shown.length && common < segs.length && shown[common] === segs[common]) {
+        common += 1;
+      }
+      shown = shown.slice(0, common);
+      for (let i = common; i < segs.length; i += 1) {
+        shown.push(segs[i]);
+        out.push({ kind: 0, title: segs[i], id: i, folder: segs.slice(0, i + 1).join('/') });
       }
       out.push({ kind: 1, title: item.title, id: item.id, folder: item.folder });
     }
@@ -2443,7 +2487,7 @@ struct Index {
                 .fontSize(12)
                 .fontColor('#8a8f98')
                 .width('100%')
-                .padding({ top: 6, bottom: 2 })
+                .padding({ left: 4 + line.id * 14, top: 6, bottom: 2 })
             } else {
               Text(line.title)
                 .fontSize(13)
@@ -2460,7 +2504,7 @@ struct Index {
                 })
                 .gesture(LongPressGesture().onAction(() => { this.deleteMemory(line.id); }))
             }
-          }, (line: MemLine) => `${line.kind}-${line.id}-${line.title}`)
+          }, (line: MemLine) => `${line.kind}-${line.folder}-${line.id}-${line.title}`)
         }
         .width('100%')
       }
@@ -3309,15 +3353,16 @@ struct Index {
           .onClick(() => { void this.addMemoQuick(); })
       }
       .width('100%')
-      ForEach(this.memos, (m: string, i: number) => {
-        Text(m)
+      ForEach(this.memos, (item: MemoItem, i: number) => {
+        Text(item.body)
           .fontSize(12)
           .fontColor('#3a3a40')
           .width('100%')
           .padding(8)
           .borderRadius(8)
           .backgroundColor('#F7F7FA')
-      }, (m: string, i: number) => `${i}-${m.length}`)
+          .onClick(() => { this.deleteMemo(item.id); })
+      }, (item: MemoItem, i: number) => `${item.id}-${item.body.length}`)
 
       Row({ space: 8 }) {
         TextInput({ text: this.cdTitle, placeholder: '倒计时名称' })
@@ -3339,15 +3384,16 @@ struct Index {
           .onClick(() => { void this.addCountdownQuick(); })
       }
       .width('100%')
-      ForEach(this.countdowns, (c: string, i: number) => {
-        Text(c)
+      ForEach(this.countdowns, (item: CountdownItem, i: number) => {
+        Text(`${item.date}  ${item.title}`)
           .fontSize(12)
           .fontColor('#3a3a40')
           .width('100%')
           .padding(8)
           .borderRadius(8)
           .backgroundColor('#F7F7FA')
-      }, (c: string, i: number) => `${i}-${c.length}`)
+          .onClick(() => { this.deleteCountdown(item.id); })
+      }, (item: CountdownItem, i: number) => `${item.id}-${item.date}`)
 
       Row({ space: 8 }) {
         Text(`共 ${this.flashTotal} 张闪卡`)
